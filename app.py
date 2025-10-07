@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 from datetime import datetime
-import sys
+import math
 
 st.set_page_config(page_title="Loyalty Target Optimizer", layout="wide")
 st.title("🔎 Loyalty Target Optimizer (SIG Retail Insight)")
@@ -119,7 +119,8 @@ agg['Score'] = (
 
 agg = agg.sort_values('Score', ascending=False).reset_index(drop=True)
 
-st.subheader("📈 Statistik ringkas")
+# ---------------- Show preprocessing results ----------------
+st.subheader("📈 Statistik ringkas (setelah preprocessing & scoring awal)")
 col1, col2, col3 = st.columns(3)
 col1.metric("Jumlah Toko (unik)", agg['ID Toko'].nunique())
 col2.metric("Jumlah transaksi (baris)", len(df))
@@ -134,43 +135,89 @@ with c2:
     st.write("Cluster (toko level)")
     st.dataframe(agg['Cluster'].value_counts())
 
-# ---------------- Optimization UI ----------------
-st.sidebar.header("⚙️ Pengaturan Optimasi")
-N_max = st.sidebar.number_input("Jumlah Toko Maksimal (N_max)", min_value=1, max_value=agg.shape[0], value=min(500, agg.shape[0]), step=1)
+st.markdown("---")
 
-st.sidebar.markdown("**Atur persentase maksimal per cluster** (nilai antara 0 - 100). Nilai adalah persentase dari N_max.")
+# ---------------- Settings (placed AFTER preprocessing as requested) ----------------
+st.subheader("⚙️ Pengaturan Seleksi & Proporsi Cluster (letak di bawah hasil preprocessing)")
+
+# 1) N_max input (jumlah toko terpilih)
+total_available = agg.shape[0]
+N_max = st.number_input("1) Jumlah Toko Maksimal (N_max) — jumlah toko yang ingin dipilih untuk program loyalty",
+                        min_value=1, max_value=total_available, value=min(500, total_available), step=1)
+
+st.write(f"Total toko tersedia untuk dipilih: **{total_available}** — N_max diset ke **{N_max}**")
+
+# 2) Persentase maksimal per cluster (user input but auto-normalize to 100%)
 clusters_list = sorted(agg['Cluster'].unique())
-cluster_caps = {}
-default_pct = round(100.0 / len(clusters_list), 1)
-for c in clusters_list:
-    pct = st.sidebar.number_input(f"Max % untuk cluster {c}", min_value=0.0, max_value=100.0, value=float(default_pct), step=0.5, key=f"pct_{c}")
-    cluster_caps[c] = pct / 100.0  # convert to fraction
+st.write("2) Atur Persentase Maksimum per Cluster (total harus = 100%). Jika total != 100%, sistem akan menormalisasi otomatis.")
+cols = st.columns(len(clusters_list))
+cluster_pct_inputs = {}
+# default equal split
+default_vals = [round(100.0 / len(clusters_list), 2)] * len(clusters_list)
+for i, c in enumerate(clusters_list):
+    with cols[i]:
+        v = st.number_input(f"{c} (%)", min_value=0.0, max_value=100.0, value=float(default_vals[i]), step=0.5, key=f"clpct_{c}")
+        cluster_pct_inputs[c] = v
 
-# Optional: adjust weights
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Bobot skor (opsional)**")
-w1 = st.sidebar.slider("Bobot: Ratio vs Cluster", 0.0, 1.0, default_w1, 0.05)
-w2 = st.sidebar.slider("Bobot: Avg Transactions", 0.0, 1.0, default_w2, 0.05)
-w3 = st.sidebar.slider("Bobot: Ton Growth", 0.0, 1.0, default_w3, 0.05)
-# normalize weights to sum 1 if user changed them
-w_sum = w1 + w2 + w3
-if w_sum == 0:
-    w1, w2, w3 = default_w1, default_w2, default_w3
+# Validate & normalize cluster percents to sum 100%
+total_cluster_pct = sum(cluster_pct_inputs.values())
+if total_cluster_pct == 0:
+    # fallback to equal distribution
+    norm_cluster_pct = {c: 1.0/len(clusters_list) for c in clusters_list}
+    st.warning("Total persentase cluster = 0%. Diganti ke distribusi merata.")
 else:
-    w1, w2, w3 = w1 / w_sum, w2 / w_sum, w3 / w_sum
+    # normalize to 100% and convert to fraction
+    norm_cluster_pct = {c: (cluster_pct_inputs[c] / total_cluster_pct) for c in clusters_list}
+    # show message if user inputs didn't sum to 100
+    if abs(total_cluster_pct - 100.0) > 1e-6:
+        st.info(f"Persentase cluster yang dimasukkan = {total_cluster_pct:.2f}%. Dinormalisasi ke total 100% secara proporsional.")
+        # display normalized %
+        norm_display = {c: round(norm_cluster_pct[c]*100.0,2) for c in clusters_list}
+        st.write("Distribusi cluster setelah normalisasi (%) :", norm_display)
+    else:
+        st.success("Total persentase cluster = 100%.")
 
-# recompute score with chosen weights
+# 3) Bobot Skor (user sets weights; auto-normalize to sum=1)
+st.write("3) Atur Bobot Skor untuk komponen penilaian (total bobot = 100%).")
+w_col1, w_col2, w_col3 = st.columns(3)
+w_inputs = {}
+with w_col1:
+    w_inputs['ratio'] = st.number_input("Bobot: Ratio_vs_Cluster (%)", min_value=0.0, max_value=100.0, value=default_w1*100, step=1.0)
+with w_col2:
+    w_inputs['trx'] = st.number_input("Bobot: Avg_Trx (%)", min_value=0.0, max_value=100.0, value=default_w2*100, step=1.0)
+with w_col3:
+    w_inputs['growth'] = st.number_input("Bobot: Ton_Growth (%)", min_value=0.0, max_value=100.0, value=default_w3*100, step=1.0)
+
+total_w_pct = sum(w_inputs.values())
+if total_w_pct == 0:
+    w1, w2, w3 = default_w1, default_w2, default_w3
+    st.warning("Total bobot = 0%. Dipakai bobot default.")
+else:
+    # normalize to sum 1.0
+    w1 = w_inputs['ratio'] / total_w_pct
+    w2 = w_inputs['trx'] / total_w_pct
+    w3 = w_inputs['growth'] / total_w_pct
+    if abs(total_w_pct - 100.0) > 1e-6:
+        st.info(f"Total bobot yang dimasukkan = {total_w_pct:.2f}%. Dinormalisasi ke 100%. (Ratio: {w1:.2f}, Trx: {w2:.2f}, Growth: {w3:.2f})")
+    else:
+        st.success("Total bobot = 100%.")
+
+# Recompute Score with (normalized) weights and show top table preview
 agg['Score'] = (
     w1 * agg['Ratio_vs_Cluster'] +
     w2 * normalize(agg['Avg_Trx']) +
     w3 * normalize(agg['Ton_Growth'])
 )
 agg = agg.sort_values('Score', ascending=False).reset_index(drop=True)
+st.subheader("📋 Preview Top 20 setelah normalisasi bobot")
+st.dataframe(agg.head(20))
 
-st.sidebar.markdown("---")
-run_opt = st.sidebar.button("▶️ Jalankan Optimasi")
+st.markdown("---")
 
-# -------------- Optimization Execution --------------
+# ------------- Run Optimization button -------------
+st.subheader("▶️ Jalankan Optimasi")
+run_opt = st.button("Jalankan Optimasi dengan constraint di atas")
+
 if run_opt:
     # Try import pulp
     try:
@@ -199,13 +246,10 @@ if run_opt:
     # cluster constraints: for each cluster, selected_in_cluster <= p_k * N_max
     for c in clusters_list:
         members = agg[agg['Cluster'] == c]['ID Toko'].tolist()
-        cap = int(np.floor(cluster_caps[c] * float(N_max) + 1e-9))
-        # Add constraint (cap could be zero)
+        cap = int(math.floor(norm_cluster_pct[c] * float(N_max) + 1e-9))
         if len(members) > 0:
             prob += pulp.lpSum([x_vars[sid] for sid in members]) <= cap
 
-    # Additional optional constraint: ensure we don't select more stores than available per cluster (implicit)
-    # Solve
     st.info("Menjalankan solver PuLP (CBC default)...")
     solve_status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
     status = pulp.LpStatus[prob.status]
@@ -246,6 +290,6 @@ if run_opt:
 
     st.balloons()
 else:
-    st.info("Atur parameter optimasi di sidebar lalu tekan 'Jalankan Optimasi'.")
+    st.info("Sesuaikan parameter di atas lalu tekan 'Jalankan Optimasi'.")
 
 # ---------------- End ----------------
