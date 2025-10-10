@@ -199,16 +199,6 @@ if 'agg' in st.session_state:
 if 'selected_df' in st.session_state:
     st.header("✅ Hasil Seleksi Optimasi")
     selected_df = st.session_state.selected_df
-
-    st.subheader("Ringkasan Komposisi Cluster Terpilih")
-    if not selected_df.empty:
-        cluster_summary = selected_df['Cluster'].value_counts().reset_index()
-        cluster_summary.columns = ['Cluster', 'Jumlah Toko']
-        total_selected_stores = len(selected_df)
-        cluster_summary['Persentase'] = (cluster_summary['Jumlah Toko'] / total_selected_stores * 100).map('{:.2f}%'.format)
-        st.dataframe(cluster_summary, use_container_width=True)
-    else:
-        st.info("Tidak ada toko yang terpilih untuk ditampilkan ringkasannya.")
     
     total_eligible_stores = st.session_state.get('total_eligible_stores', 1)
     total_eligible_clusters = st.session_state.get('total_eligible_clusters', 1)
@@ -220,6 +210,16 @@ if 'selected_df' in st.session_state:
     res_col1.metric("Toko Terpilih", f"{len(selected_df)} ({percent_selected:.1f}%)", f"dari {total_eligible_stores} toko")
     res_col2.metric("Cakupan Cluster", f"{unique_clusters_selected} ({percent_clusters:.0f}%)", f"dari {total_eligible_clusters} cluster")
     res_col3.metric("Estimasi Budget Bulanan", f"Rp {selected_df['Estimated_Cost'].sum():,.0f}")
+
+      st.subheader("Ringkasan Komposisi Cluster Terpilih")
+    if not selected_df.empty:
+        cluster_summary = selected_df['Cluster'].value_counts().reset_index()
+        cluster_summary.columns = ['Cluster', 'Jumlah Toko']
+        total_selected_stores = len(selected_df)
+        cluster_summary['Persentase'] = (cluster_summary['Jumlah Toko'] / total_selected_stores * 100).map('{:.2f}%'.format)
+        st.dataframe(cluster_summary, use_container_width=True)
+    else:
+        st.info("Tidak ada toko yang terpilih untuk ditampilkan ringkasannya.")
     
     st.markdown("---")
     st.header("📊 Analisis Kontribusi & Efisiensi")
