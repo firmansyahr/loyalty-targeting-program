@@ -166,36 +166,7 @@ if 'selected_df' in st.session_state:
     total_estimated_budget = selected_df['Estimated_Cost'].sum()
     total_score = selected_df['Score'].sum()
     
-    # Ambil nilai N_max dan max_budget dari UI, atau default jika tidak ada
-    # Ini untuk memastikan nilai di metrik sesuai dengan input terakhir
-    n_max_value = st.session_state.get('n_max_value', N_max) 
-    max_budget_value = st.session_state.get('max_budget_value', max_budget)
-
-    res_col1, res_col2 = st.columns(2)
-    res_col1.metric("Total Toko Terpilih", f"{len(selected_df)}", f"dari target maks. {n_max_value}")
-    res_col2.metric("Estimasi Budget Bulanan", f"Rp {total_estimated_budget:,.0f}", f"dari maks. Rp {max_budget_value:,.0f}")
-    
-    st.write("Distribusi cluster dari toko terpilih:")
-    if not selected_df.empty:
-        cluster_dist = selected_df['Cluster'].value_counts().reset_index()
-        cluster_dist.columns = ['Cluster', 'Count']
-        cluster_dist['Percentage'] = (cluster_dist['Count'] / len(selected_df) * 100).map('{:.2f}%'.format)
-        st.dataframe(cluster_dist, use_container_width=True)
-    else:
-        st.write("Tidak ada toko yang terpilih.")
-
-    # --- Bagian Analisis Kontribusi ---
-    st.markdown("---")
-    st.header("📊 Analisis Kontribusi Toko Terpilih")
-
-if 'selected_df' in st.session_state:
-    st.header("✅ Hasil Seleksi Optimasi")
-    selected_df = st.session_state.selected_df
-    total_estimated_budget = selected_df['Estimated_Cost'].sum()
-    total_score = selected_df['Score'].sum()
-    
     # Mengambil nilai parameter terakhir yang digunakan saat optimasi
-    # Ini untuk memastikan tampilan metrik sesuai dengan input terakhir
     n_max_value = st.session_state.get('n_max_value_for_run', 'N/A')
     max_budget_value = st.session_state.get('max_budget_value_for_run', 'N/A')
 
