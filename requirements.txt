@@ -4,3 +4,4 @@ pulp
 geopy
 openpyxl
 xlsxwriter
+scikit-learn
