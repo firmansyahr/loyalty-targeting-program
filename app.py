@@ -27,7 +27,6 @@ st.header("Langkah 1: Upload & Proses Data Awal")
 uploaded_file = st.file_uploader("📤 Upload file transaksi (CSV / XLSX)", type=["csv", "xlsx"])
 
 if uploaded_file:
-    # ... (Logika di bagian ini sama persis seperti sebelumnya, tidak ada perubahan) ...
     col1, col2 = st.columns([3, 1])
     with col1:
         try:
@@ -52,7 +51,7 @@ if uploaded_file:
                 df['Tanggal Transaksi'] = pd.to_datetime(df['Tanggal Transaksi'], errors='coerce')
                 df.dropna(subset=['Tanggal Transaksi'], inplace=True)
                 if df.empty: st.warning("Tidak ada data transaksi."); st.stop()
-                df['Bulan'] = df['Tanggal Transaksi'].dt.to_period('M')
+                df['Bulan'] = df['Tanggal Transaksi'].dt.to_period('M').astype(str)
                 grouped = df.groupby(['ID Toko', 'Nama Toko', 'Cluster', 'Area', 'Bulan']).agg(Total_Ton=('Total Ton', 'sum'), Jumlah_Transaksi=('Tanggal Transaksi', 'count')).reset_index()
                 agg = grouped.groupby(['ID Toko', 'Nama Toko', 'Cluster', 'Area']).agg(Avg_Ton=('Total_Ton', 'mean'), Avg_Trx=('Jumlah_Transaksi', 'mean')).reset_index()
                 growths = []
@@ -66,7 +65,7 @@ if uploaded_file:
                 agg['Ton_Growth'] = growths
                 cluster_avg = agg.groupby('Cluster')['Avg_Ton'].mean().to_dict()
                 agg['Ratio_vs_Cluster'] = agg.apply(lambda x: x['Avg_Ton'] / cluster_avg.get(x['Cluster'], 1.0), axis=1)
-                st.session_state.agg = agg; st.session_state.df = df
+                st.session_state.agg = agg; st.session_state.df = df; st.session_state.grouped = grouped
                 st.success("Data berhasil diproses!")
 st.markdown("---")
 
@@ -77,34 +76,19 @@ if 'agg' in st.session_state:
     base_agg = st.session_state.agg
     
     st.subheader("📍 Pengaturan Filter")
-    # Filter Area
     available_areas = sorted(base_agg['Area'].unique())
     selected_areas = st.multiselect("Pilih Area", available_areas, default=available_areas)
     if not selected_areas: st.warning("Pilih minimal satu Area."); st.stop()
     agg = base_agg[base_agg['Area'].isin(selected_areas)].copy()
     
-    # --- FITUR BARU: Pengecualian ID Toko ---
-    excluded_ids_str = st.text_area(
-        "❌ Kecualikan ID Toko (opsional)",
-        placeholder="Salin dan tempel (copy-paste) kolom ID Toko dari Excel di sini. Setiap ID di baris baru.",
-        height=150
-    )
-    
+    excluded_ids_str = st.text_area("❌ Kecualikan ID Toko (opsional)", placeholder="Salin-tempel kolom ID Toko dari Excel di sini.", height=150)
     if excluded_ids_str:
-        # Proses input: pisahkan per baris, hapus spasi, dan buang baris kosong
         excluded_ids_list = [toko_id.strip() for toko_id in excluded_ids_str.splitlines() if toko_id.strip()]
-        
-        # Konversi ID Toko di DataFrame ke string untuk pencocokan yang aman
         agg['ID Toko'] = agg['ID Toko'].astype(str)
-        
-        # Filter DataFrame untuk membuang ID yang dikecualikan
         agg = agg[~agg['ID Toko'].isin(excluded_ids_list)]
-        
         st.info(f"✅ Sebanyak **{len(excluded_ids_list)} ID Toko** telah ditandai untuk dikecualikan.")
-    # --- AKHIR FITUR BARU ---
         
     st.subheader("💰 Pengaturan Anggaran & Seleksi")
-    # ... (Sisa kode di bagian ini sama persis, tidak ada perubahan) ...
     col1, col2 = st.columns(2)
     with col1: max_budget = st.number_input("Anggaran Maksimal (Rp)", 0, value=1_000_000_000, step=50_000_000)
     with col2:
@@ -112,7 +96,6 @@ if 'agg' in st.session_state:
         N_max = st.number_input("Jumlah Toko Maksimal (N_max)", 1, max(1, total_available), value=min(500, total_available), step=1)
 
     st.subheader("⚙️ Pengaturan Bobot & Batasan Cluster")
-    st.write("Atur Bobot Skor")
     w_col1, w_col2, w_col3 = st.columns(3)
     with w_col1: w_ratio = st.number_input("Bobot: Ratio_vs_Cluster (%)", 0.0, value=50.0)
     with w_col2: w_trx = st.number_input("Bobot: Avg_Trx (%)", 0.0, value=30.0)
@@ -121,17 +104,15 @@ if 'agg' in st.session_state:
     w1, w2, w3 = (w_ratio/total_w_pct, w_trx/total_w_pct, w_growth/total_w_pct) if total_w_pct > 0 else (0.5, 0.3, 0.2)
     
     clusters_list = sorted(agg['Cluster'].unique())
-    st.write("Atur Batas Maksimal per Cluster (isi 0 jika tanpa batas)")
     cols = st.columns(len(clusters_list))
     cluster_pct_inputs = {}
     for i, c in enumerate(clusters_list):
         with cols[i]:
-            v = st.number_input(f"{c} (%)", 0.0, 100.0, value=0.0, key=f"clpct_{c}")
+            v = st.number_input(f"Batas Maks. {c} (%)", 0.0, 100.0, value=0.0, key=f"clpct_{c}")
             cluster_pct_inputs[c] = v
 
     st.markdown("---")
     if st.button("▶️ Jalankan Optimasi", type="primary"):
-        # Menyimpan nilai parameter terakhir untuk ditampilkan di hasil
         st.session_state.n_max_value_for_run = N_max
         st.session_state.max_budget_value_for_run = f"Rp {max_budget:,.0f}"
 
@@ -147,7 +128,6 @@ if 'agg' in st.session_state:
         except ImportError: st.error("Library 'pulp' tidak ditemukan."); st.stop()
         
         with st.spinner("Menjalankan optimasi..."):
-            # ... (Logika optimasi PuLP sama persis, tidak ada perubahan) ...
             prob = pulp.LpProblem("Loyalty_Selection", pulp.LpMaximize)
             x_vars = {row['ID Toko']: pulp.LpVariable(f"x_{row['ID Toko']}", cat='Binary') for _, row in agg_final.iterrows()}
             prob += pulp.lpSum([row['Score'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()])
@@ -159,12 +139,12 @@ if 'agg' in st.session_state:
                     cap = int(math.floor((max_pct / 100.0) * float(N_max)))
                     if members: prob += pulp.lpSum([x_vars[sid] for sid in members]) <= cap
             prob.solve(pulp.PULP_CBC_CMD(msg=False))
-            selected_ids = [sid for sid, var in x_vars.items() if pulp.value(var) == 1]
+            selected_ids = [str(sid) for sid, var in x_vars.items() if pulp.value(var) == 1]
+            agg_final['ID Toko'] = agg_final['ID Toko'].astype(str)
             st.session_state.selected_df = agg_final[agg_final['ID Toko'].isin(selected_ids)].sort_values('Score', ascending=False, ignore_index=True)
             st.success("Optimasi selesai!")
 
 if 'selected_df' in st.session_state:
-    # ... (Seluruh blok kode untuk menampilkan hasil sama persis, tidak ada perubahan) ...
     st.header("✅ Hasil Seleksi Optimasi")
     selected_df = st.session_state.selected_df
     total_estimated_budget = selected_df['Estimated_Cost'].sum()
@@ -174,34 +154,82 @@ if 'selected_df' in st.session_state:
     res_col1, res_col2 = st.columns(2)
     res_col1.metric("Total Toko Terpilih", f"{len(selected_df)}", f"dari target maks. {n_max_value}")
     res_col2.metric("Estimasi Budget Bulanan", f"Rp {total_estimated_budget:,.0f}", f"dari maks. {max_budget_value}")
-    st.write("Distribusi cluster dari toko terpilih:")
-    if not selected_df.empty:
-        cluster_dist = selected_df['Cluster'].value_counts().reset_index()
-        cluster_dist.columns = ['Cluster', 'Count']
-        cluster_dist['Percentage'] = (cluster_dist['Count'] / len(selected_df) * 100).map('{:.2f}%'.format)
-        st.dataframe(cluster_dist, use_container_width=True)
-    else:
-        st.write("Tidak ada toko yang terpilih.")
+    
     st.markdown("---")
-    st.header("📊 Analisis Kontribusi Toko Terpilih")
+    st.header("📊 Analisis Kontribusi & Efisiensi")
     if not selected_df.empty:
+        # Menghitung metrik analisis
         selected_df['Kontribusi_Skor_%'] = (selected_df['Score'] / total_score * 100)
         selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / (total_estimated_budget + 1e-9) * 100)
         selected_df['Efisiensi (Skor per 1 Juta Biaya)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
+        
+        # --- MODIFIKASI: Buat kolom gabungan untuk label grafik ---
+        selected_df['ID_dan_Nama'] = selected_df['ID Toko'].astype(str) + ' - ' + selected_df['Nama Toko']
+
         st.subheader("Kontribusi Teratas")
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Top 10 Kontributor Skor**")
-            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Skor_%'), x='Nama Toko', y='Kontribusi_Skor_%')
+            # --- MODIFIKASI: Gunakan kolom gabungan untuk sumbu x ---
+            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Skor_%'), x='ID_dan_Nama', y='Kontribusi_Skor_%')
         with c2:
             st.write("**Top 10 Kontributor Budget**")
-            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Budget_%'), x='Nama Toko', y='Kontribusi_Budget_%')
+            # --- MODIFIKASI: Gunakan kolom gabungan untuk sumbu x ---
+            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Budget_%'), x='ID_dan_Nama', y='Kontribusi_Budget_%')
+
         st.subheader("Analisis Efisiensi (Value for Money)")
-        st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
-        chart = alt.Chart(selected_df).mark_circle().encode(x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'), y=alt.Y('Score', title='Skor Performa'), color='Cluster', tooltip=['ID Toko','Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'], size='Avg_Ton').interactive()
+        st.write("Arahkan mouse ke titik untuk melihat detail, termasuk ID Toko.")
+        chart = alt.Chart(selected_df).mark_circle().encode(
+            x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
+            y=alt.Y('Score', title='Skor Performa'),
+            color='Cluster',
+            # --- MODIFIKASI: Tambahkan ID Toko ke tooltip ---
+            tooltip=['ID Toko', 'Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'],
+            size='Avg_Ton'
+        ).interactive()
         st.altair_chart(chart, use_container_width=True)
-        st.subheader("Data Lengkap Toko Terpilih dengan Analisis")
-        st.dataframe(selected_df[['Area', 'ID Toko', 'Nama Toko', 'Cluster', 'Score', 'Estimated_Cost', 'Kontribusi_Skor_%', 'Kontribusi_Budget_%', 'Efisiensi (Skor per 1 Juta Biaya)']].style.format({'Estimated_Cost': "Rp {:,.0f}", 'Kontribusi_Skor_%': "{:.2f}%", 'Kontribusi_Budget_%': "{:.2f}%", 'Efisiensi (Skor per 1 Juta Biaya)': "{:,.2f}"}))
+
+        st.subheader("Data Lengkap Toko Terpilih")
+        # --- MODIFIKASI: Tambahkan ID Toko ke tabel ---
+        st.dataframe(selected_df[[
+            'ID Toko', 'Nama Toko', 'Cluster', 'Area', 'Score', 'Estimated_Cost', 
+            'Kontribusi_Skor_%', 'Kontribusi_Budget_%', 'Efisiensi (Skor per 1 Juta Biaya)'
+        ]].style.format({
+            'Estimated_Cost': "Rp {:,.0f}",
+            'Kontribusi_Skor_%': "{:.2f}%",
+            'Kontribusi_Budget_%': "{:.2f}%",
+            'Efisiensi (Skor per 1 Juta Biaya)': "{:,.2f}"
+        }))
+        
         excel_bytes = to_excel_bytes(selected_df)
         st.download_button("⬇️ Download Hasil Lengkap (Excel)", data=excel_bytes, file_name="analisis_optimasi_toko.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.balloons()
+
+    st.markdown("---")
+    st.header("📈 Analisis Tren Performa Bulanan")
+    if 'grouped' in st.session_state and not selected_df.empty:
+        grouped_monthly_data = st.session_state.grouped
+        grouped_monthly_data['ID Toko'] = grouped_monthly_data['ID Toko'].astype(str)
+        trend_data = grouped_monthly_data[grouped_monthly_data['ID Toko'].isin(selected_df['ID Toko'])]
+        
+        st.subheader("Tren Agregat (Semua Toko Terpilih)")
+        agregat_trend = trend_data.groupby('Bulan')['Total_Ton'].sum().reset_index()
+        st.line_chart(agregat_trend, x='Bulan', y='Total_Ton')
+
+        st.subheader("Perbandingan Tren per Toko")
+        list_toko_terpilih = selected_df['Nama Toko'].unique().tolist()
+        toko_untuk_dibandingkan = st.multiselect(
+            "Pilih toko untuk dibandingkan trennya:",
+            options=list_toko_terpilih,
+            default=list_toko_terpilih[:5]
+        )
+        if toko_untuk_dibandingkan:
+            comparison_data = trend_data[trend_data['Nama Toko'].isin(toko_untuk_dibandingkan)]
+            trend_chart = alt.Chart(comparison_data).mark_line(point=True).encode(
+                x=alt.X('Bulan', title='Bulan', sort=None),
+                y=alt.Y('Total_Ton', title='Total Tonase'),
+                color=alt.Color('Nama Toko', title='Nama Toko'),
+                # --- MODIFIKASI: Tambahkan ID Toko ke tooltip ---
+                tooltip=['ID Toko', 'Nama Toko', 'Bulan', 'Total_Ton']
+            ).interactive()
+            st.altair_chart(trend_chart, use_container_width=True)
