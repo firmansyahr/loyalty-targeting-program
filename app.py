@@ -210,8 +210,8 @@ if 'selected_df' in st.session_state:
     res_col1.metric("Toko Terpilih", f"{len(selected_df)} ({percent_selected:.1f}%)", f"dari {total_eligible_stores} toko")
     res_col2.metric("Cakupan Cluster", f"{unique_clusters_selected} ({percent_clusters:.0f}%)", f"dari {total_eligible_clusters} cluster")
     res_col3.metric("Estimasi Budget Bulanan", f"Rp {selected_df['Estimated_Cost'].sum():,.0f}")
-
-      st.subheader("Ringkasan Komposisi Cluster Terpilih")
+    
+    st.subheader("Ringkasan Komposisi Cluster Terpilih")
     if not selected_df.empty:
         cluster_summary = selected_df['Cluster'].value_counts().reset_index()
         cluster_summary.columns = ['Cluster', 'Jumlah Toko']
