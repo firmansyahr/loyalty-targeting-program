@@ -118,4 +118,90 @@ if 'agg' in st.session_state:
     with w_col2: w_trx = st.number_input("Bobot: Avg_Trx (%)", 0.0, value=30.0)
     with w_col3: w_growth = st.number_input("Bobot: Ton_Growth (%)", 0.0, value=20.0)
     total_w_pct = w_ratio + w_trx + w_growth
-    w1, w2, w3 = (w_ratio/total_w_pct, w_trx/total_w_
+    w1, w2, w3 = (w_ratio/total_w_pct, w_trx/total_w_pct, w_growth/total_w_pct) if total_w_pct > 0 else (0.5, 0.3, 0.2)
+    
+    clusters_list = sorted(agg['Cluster'].unique())
+    st.write("Atur Batas Maksimal per Cluster (isi 0 jika tanpa batas)")
+    cols = st.columns(len(clusters_list))
+    cluster_pct_inputs = {}
+    for i, c in enumerate(clusters_list):
+        with cols[i]:
+            v = st.number_input(f"{c} (%)", 0.0, 100.0, value=0.0, key=f"clpct_{c}")
+            cluster_pct_inputs[c] = v
+
+    st.markdown("---")
+    if st.button("▶️ Jalankan Optimasi", type="primary"):
+        # Menyimpan nilai parameter terakhir untuk ditampilkan di hasil
+        st.session_state.n_max_value_for_run = N_max
+        st.session_state.max_budget_value_for_run = f"Rp {max_budget:,.0f}"
+
+        agg_final = agg.copy()
+        agg_final['Score'] = (w1*agg_final['Ratio_vs_Cluster'] + w2*normalize(agg_final['Avg_Trx']) + w3*normalize(agg_final['Ton_Growth']))
+        poin_to_rupiah = {'BRONZE': 10000, 'SILVER': 12500, 'GOLD': 15000, 'PLATINUM': 17500, 'SUPER PLATINUM': 20000}
+        agg_final['Rupiah_per_Poin'] = agg_final['Cluster'].str.upper().map(poin_to_rupiah).fillna(0)
+        agg_final['Estimated_Cost'] = agg_final['Avg_Ton'] * agg_final['Rupiah_per_Poin']
+        agg_final.sort_values('Score', ascending=False, inplace=True)
+        agg_final.drop_duplicates(subset=['ID Toko'], keep='first', inplace=True, ignore_index=True)
+        
+        try: import pulp
+        except ImportError: st.error("Library 'pulp' tidak ditemukan."); st.stop()
+        
+        with st.spinner("Menjalankan optimasi..."):
+            # ... (Logika optimasi PuLP sama persis, tidak ada perubahan) ...
+            prob = pulp.LpProblem("Loyalty_Selection", pulp.LpMaximize)
+            x_vars = {row['ID Toko']: pulp.LpVariable(f"x_{row['ID Toko']}", cat='Binary') for _, row in agg_final.iterrows()}
+            prob += pulp.lpSum([row['Score'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()])
+            prob += pulp.lpSum(x_vars.values()) <= int(N_max)
+            prob += pulp.lpSum([row['Estimated_Cost'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()]) <= max_budget
+            for cluster_name, max_pct in cluster_pct_inputs.items():
+                if max_pct > 0:
+                    members = agg_final[agg_final['Cluster'] == cluster_name]['ID Toko'].tolist()
+                    cap = int(math.floor((max_pct / 100.0) * float(N_max)))
+                    if members: prob += pulp.lpSum([x_vars[sid] for sid in members]) <= cap
+            prob.solve(pulp.PULP_CBC_CMD(msg=False))
+            selected_ids = [sid for sid, var in x_vars.items() if pulp.value(var) == 1]
+            st.session_state.selected_df = agg_final[agg_final['ID Toko'].isin(selected_ids)].sort_values('Score', ascending=False, ignore_index=True)
+            st.success("Optimasi selesai!")
+
+if 'selected_df' in st.session_state:
+    # ... (Seluruh blok kode untuk menampilkan hasil sama persis, tidak ada perubahan) ...
+    st.header("✅ Hasil Seleksi Optimasi")
+    selected_df = st.session_state.selected_df
+    total_estimated_budget = selected_df['Estimated_Cost'].sum()
+    total_score = selected_df['Score'].sum()
+    n_max_value = st.session_state.get('n_max_value_for_run', 'N/A')
+    max_budget_value = st.session_state.get('max_budget_value_for_run', 'N/A')
+    res_col1, res_col2 = st.columns(2)
+    res_col1.metric("Total Toko Terpilih", f"{len(selected_df)}", f"dari target maks. {n_max_value}")
+    res_col2.metric("Estimasi Budget Bulanan", f"Rp {total_estimated_budget:,.0f}", f"dari maks. {max_budget_value}")
+    st.write("Distribusi cluster dari toko terpilih:")
+    if not selected_df.empty:
+        cluster_dist = selected_df['Cluster'].value_counts().reset_index()
+        cluster_dist.columns = ['Cluster', 'Count']
+        cluster_dist['Percentage'] = (cluster_dist['Count'] / len(selected_df) * 100).map('{:.2f}%'.format)
+        st.dataframe(cluster_dist, use_container_width=True)
+    else:
+        st.write("Tidak ada toko yang terpilih.")
+    st.markdown("---")
+    st.header("📊 Analisis Kontribusi Toko Terpilih")
+    if not selected_df.empty:
+        selected_df['Kontribusi_Skor_%'] = (selected_df['Score'] / total_score * 100)
+        selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / (total_estimated_budget + 1e-9) * 100)
+        selected_df['Efisiensi (Skor per 1 Juta Biaya)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
+        st.subheader("Kontribusi Teratas")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Top 10 Kontributor Skor**")
+            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Skor_%'), x='Nama Toko', y='Kontribusi_Skor_%')
+        with c2:
+            st.write("**Top 10 Kontributor Budget**")
+            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Budget_%'), x='Nama Toko', y='Kontribusi_Budget_%')
+        st.subheader("Analisis Efisiensi (Value for Money)")
+        st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
+        chart = alt.Chart(selected_df).mark_circle().encode(x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'), y=alt.Y('Score', title='Skor Performa'), color='Cluster', tooltip=['Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'], size='Avg_Ton').interactive()
+        st.altair_chart(chart, use_container_width=True)
+        st.subheader("Data Lengkap Toko Terpilih dengan Analisis")
+        st.dataframe(selected_df[['Nama Toko', 'Cluster', 'Area', 'Score', 'Estimated_Cost', 'Kontribusi_Skor_%', 'Kontribusi_Budget_%', 'Efisiensi (Skor per 1 Juta Biaya)']].style.format({'Estimated_Cost': "Rp {:,.0f}", 'Kontribusi_Skor_%': "{:.2f}%", 'Kontribusi_Budget_%': "{:.2f}%", 'Efisiensi (Skor per 1 Juta Biaya)': "{:,.2f}"}))
+        excel_bytes = to_excel_bytes(selected_df)
+        st.download_button("⬇️ Download Hasil Lengkap (Excel)", data=excel_bytes, file_name="analisis_optimasi_toko.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.balloons()
