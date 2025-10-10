@@ -5,3 +5,4 @@ geopy
 openpyxl
 xlsxwriter
 scikit-learn
+altair
