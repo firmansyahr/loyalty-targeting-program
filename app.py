@@ -160,10 +160,38 @@ if 'selected_df' in st.session_state:
     st.markdown("---")
     st.header("📊 Analisis Kontribusi Toko Terpilih")
 
+   if 'selected_df' in st.session_state:
+    st.header("✅ Hasil Seleksi Optimasi")
+    selected_df = st.session_state.selected_df
+    total_estimated_budget = selected_df['Estimated_Cost'].sum()
+    total_score = selected_df['Score'].sum()
+    
+    # Ambil nilai N_max dan max_budget dari UI, atau default jika tidak ada
+    # Ini untuk memastikan nilai di metrik sesuai dengan input terakhir
+    n_max_value = st.session_state.get('n_max_value', N_max) 
+    max_budget_value = st.session_state.get('max_budget_value', max_budget)
+
+    res_col1, res_col2 = st.columns(2)
+    res_col1.metric("Total Toko Terpilih", f"{len(selected_df)}", f"dari target maks. {n_max_value}")
+    res_col2.metric("Estimasi Budget Bulanan", f"Rp {total_estimated_budget:,.0f}", f"dari maks. Rp {max_budget_value:,.0f}")
+    
+    st.write("Distribusi cluster dari toko terpilih:")
+    if not selected_df.empty:
+        cluster_dist = selected_df['Cluster'].value_counts().reset_index()
+        cluster_dist.columns = ['Cluster', 'Count']
+        cluster_dist['Percentage'] = (cluster_dist['Count'] / len(selected_df) * 100).map('{:.2f}%'.format)
+        st.dataframe(cluster_dist, use_container_width=True)
+    else:
+        st.write("Tidak ada toko yang terpilih.")
+
+    # --- Bagian Analisis Kontribusi ---
+    st.markdown("---")
+    st.header("📊 Analisis Kontribusi Toko Terpilih")
+
     if not selected_df.empty:
         # 1. Hitung metrik kontribusi dan efisiensi
         selected_df['Kontribusi_Skor_%'] = (selected_df['Score'] / total_score * 100)
-        selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / total_estimated_budget * 100)
+        selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / (total_estimated_budget + 1e-9) * 100)
         selected_df['Efisiensi (Skor per 1 Juta Biaya)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
 
         # 2. Tampilkan visualisasi
@@ -180,18 +208,18 @@ if 'selected_df' in st.session_state:
 
         st.subheader("Analisis Efisiensi (Value for Money)")
         st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
-     # Ganti blok st.scatter_plot yang lama dengan ini:
-st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
-
-chart = alt.Chart(selected_df).mark_circle().encode(
-    x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
-    y=alt.Y('Score', title='Skor Performa'),
-    color='Cluster',
-    tooltip=['Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'],
-    size='Avg_Ton'
-).interactive()
-
-st.altair_chart(chart, use_container_width=True)
+        
+        # Perbaikan dari error sebelumnya
+        st.altair_chart(
+            alt.Chart(selected_df).mark_circle().encode(
+                x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
+                y=alt.Y('Score', title='Skor Performa'),
+                color='Cluster',
+                tooltip=['Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'],
+                size='Avg_Ton'
+            ).interactive(),
+            use_container_width=True
+        )
 
         # 3. Tampilkan tabel lengkap dengan data analisis
         st.subheader("Data Lengkap Toko Terpilih dengan Analisis")
@@ -208,4 +236,3 @@ st.altair_chart(chart, use_container_width=True)
         excel_bytes = to_excel_bytes(selected_df)
         st.download_button("⬇️ Download Hasil Lengkap (Excel)", data=excel_bytes, file_name="analisis_optimasi_toko.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.balloons()
-    # --- AKHIR MODIFIKASI ---
