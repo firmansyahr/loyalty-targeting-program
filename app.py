@@ -188,40 +188,59 @@ if 'selected_df' in st.session_state:
     st.markdown("---")
     st.header("📊 Analisis Kontribusi Toko Terpilih")
 
+if 'selected_df' in st.session_state:
+    st.header("✅ Hasil Seleksi Optimasi")
+    selected_df = st.session_state.selected_df
+    total_estimated_budget = selected_df['Estimated_Cost'].sum()
+    total_score = selected_df['Score'].sum()
+    
+    # Mengambil nilai parameter terakhir yang digunakan saat optimasi
+    # Ini untuk memastikan tampilan metrik sesuai dengan input terakhir
+    n_max_value = st.session_state.get('n_max_value_for_run', 'N/A')
+    max_budget_value = st.session_state.get('max_budget_value_for_run', 'N/A')
+
+    res_col1, res_col2 = st.columns(2)
+    res_col1.metric("Total Toko Terpilih", f"{len(selected_df)}", f"dari target maks. {n_max_value}")
+    res_col2.metric("Estimasi Budget Bulanan", f"Rp {total_estimated_budget:,.0f}", f"dari maks. Rp {max_budget_value:,.0f}")
+    
+    st.write("Distribusi cluster dari toko terpilih:")
     if not selected_df.empty:
-        # 1. Hitung metrik kontribusi dan efisiensi
+        cluster_dist = selected_df['Cluster'].value_counts().reset_index()
+        cluster_dist.columns = ['Cluster', 'Count']
+        cluster_dist['Percentage'] = (cluster_dist['Count'] / len(selected_df) * 100).map('{:.2f}%'.format)
+        st.dataframe(cluster_dist, use_container_width=True)
+    else:
+        st.write("Tidak ada toko yang terpilih.")
+
+    st.markdown("---")
+    st.header("📊 Analisis Kontribusi Toko Terpilih")
+
+    if not selected_df.empty:
         selected_df['Kontribusi_Skor_%'] = (selected_df['Score'] / total_score * 100)
         selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / (total_estimated_budget + 1e-9) * 100)
         selected_df['Efisiensi (Skor per 1 Juta Biaya)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
 
-        # 2. Tampilkan visualisasi
         st.subheader("Kontribusi Teratas")
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Top 10 Kontributor Skor**")
-            top_score_contributors = selected_df.nlargest(10, 'Kontribusi_Skor_%')
-            st.bar_chart(top_score_contributors, x='Nama Toko', y='Kontribusi_Skor_%')
+            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Skor_%'), x='Nama Toko', y='Kontribusi_Skor_%')
         with c2:
             st.write("**Top 10 Kontributor Budget**")
-            top_budget_contributors = selected_df.nlargest(10, 'Kontribusi_Budget_%')
-            st.bar_chart(top_budget_contributors, x='Nama Toko', y='Kontribusi_Budget_%')
+            st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Budget_%'), x='Nama Toko', y='Kontribusi_Budget_%')
 
         st.subheader("Analisis Efisiensi (Value for Money)")
         st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
         
-        # Perbaikan dari error sebelumnya
-        st.altair_chart(
-            alt.Chart(selected_df).mark_circle().encode(
-                x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
-                y=alt.Y('Score', title='Skor Performa'),
-                color='Cluster',
-                tooltip=['Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'],
-                size='Avg_Ton'
-            ).interactive(),
-            use_container_width=True
-        )
+        chart = alt.Chart(selected_df).mark_circle().encode(
+            x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
+            y=alt.Y('Score', title='Skor Performa'),
+            color='Cluster',
+            tooltip=['Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'],
+            size='Avg_Ton'
+        ).interactive()
+        st.altair_chart(chart, use_container_width=True)
 
-        # 3. Tampilkan tabel lengkap dengan data analisis
         st.subheader("Data Lengkap Toko Terpilih dengan Analisis")
         st.dataframe(selected_df[[
             'Nama Toko', 'Cluster', 'Area', 'Score', 'Estimated_Cost', 
