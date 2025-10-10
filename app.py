@@ -180,15 +180,18 @@ if 'selected_df' in st.session_state:
 
         st.subheader("Analisis Efisiensi (Value for Money)")
         st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
-        st.scatter_plot(
-            selected_df,
-            x='Estimated_Cost',
-            y='Score',
-            color='Cluster',
-            size='Avg_Ton',
-            x_label="Estimasi Biaya (Rp)",
-            y_label="Skor Performa"
-        )
+     # Ganti blok st.scatter_plot yang lama dengan ini:
+st.write("Grafik ini memetakan semua toko terpilih. Cari toko di **pojok kiri atas**: skor tinggi dengan biaya rendah.")
+
+chart = alt.Chart(selected_df).mark_circle().encode(
+    x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
+    y=alt.Y('Score', title='Skor Performa'),
+    color='Cluster',
+    tooltip=['Nama Toko', 'Cluster', 'Score', 'Estimated_Cost'],
+    size='Avg_Ton'
+).interactive()
+
+st.altair_chart(chart, use_container_width=True)
 
         # 3. Tampilkan tabel lengkap dengan data analisis
         st.subheader("Data Lengkap Toko Terpilih dengan Analisis")
