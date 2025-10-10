@@ -200,7 +200,7 @@ if 'selected_df' in st.session_state:
     st.header("✅ Hasil Seleksi Optimasi")
     selected_df = st.session_state.selected_df
 
-      st.subheader("Ringkasan Komposisi Cluster Terpilih")
+    st.subheader("Ringkasan Komposisi Cluster Terpilih")
     if not selected_df.empty:
         cluster_summary = selected_df['Cluster'].value_counts().reset_index()
         cluster_summary.columns = ['Cluster', 'Jumlah Toko']
