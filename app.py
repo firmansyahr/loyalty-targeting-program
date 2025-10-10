@@ -70,22 +70,18 @@ if uploaded_file:
                 df['Tanggal Transaksi'] = pd.to_datetime(df['Tanggal Transaksi'], errors='coerce')
                 df.dropna(subset=['Tanggal Transaksi'], inplace=True)
 
-                # --- MODIFIKASI UTAMA: Mengisi nilai kosong dengan metode Forward Fill ---
-                # 1. Urutkan data berdasarkan Toko dan Tanggal (WAJIB untuk ffill)
+                # Logika Imputasi: ffill -> bfill -> dropna
                 df.sort_values(by=['ID Toko', 'Tanggal Transaksi'], inplace=True)
-
-                # 2. Lakukan forward fill untuk kolom kategorikal per grup ID Toko
                 categorical_cols = ['Nama Toko', 'Cluster', 'Area', 'Brands', 'Nama Produk']
                 for col in categorical_cols:
                     if col in df.columns:
-                        df[col] = df.groupby('ID Toko')[col].ffill()
-
-                # 3. Sebagai pengaman, isi sisa NaN (jika ada di baris pertama) dengan 'TIDAK DIKETAHUI'
-                df.fillna({col: 'TIDAK DIKETAHUI' for col in categorical_cols}, inplace=True)
-                # --- AKHIR MODIFIKASI UTAMA ---
+                        df[col] = df.groupby('ID Toko')[col].transform(lambda x: x.ffill().bfill())
+                
+                # Hapus baris yang masih memiliki NaN di kolom penting setelah imputasi
+                df.dropna(subset=['Nama Toko', 'Cluster', 'Area'], inplace=True)
                 
                 if df.empty:
-                    st.warning("Tidak ada data transaksi yang valid setelah diproses.")
+                    st.warning("Tidak ada data yang valid setelah diproses dan dibersihkan.")
                     st.stop()
                 
                 df['Bulan'] = df['Tanggal Transaksi'].dt.to_period('M').astype(str)
@@ -110,7 +106,7 @@ if uploaded_file:
                 st.session_state.agg = agg
                 st.session_state.df = df
                 st.session_state.grouped = grouped
-                st.success("Data berhasil diproses! Nilai kosong telah diisi dengan nilai terakhir yang valid.")
+                st.success("Data berhasil diproses dan dibersihkan!")
 
 st.markdown("---")
 
@@ -164,9 +160,6 @@ if 'agg' in st.session_state:
 
     st.markdown("---")
     if st.button("▶️ Jalankan Optimasi", type="primary"):
-        st.session_state.n_max_value_for_run = N_max
-        st.session_state.max_budget_value_for_run = f"Rp {max_budget:,.0f}"
-
         agg_final = agg.copy()
         agg_final['Score'] = (w1*agg_final['Ratio_vs_Cluster'] + w2*normalize(agg_final['Avg_Trx']) + w3*normalize(agg_final['Ton_Growth']))
         poin_to_rupiah = {'BRONZE': 10000, 'SILVER': 12500, 'GOLD': 15000, 'PLATINUM': 17500, 'SUPER PLATINUM': 20000}
@@ -175,6 +168,11 @@ if 'agg' in st.session_state:
         agg_final.sort_values('Score', ascending=False, inplace=True)
         agg_final.drop_duplicates(subset=['ID Toko'], keep='first', inplace=True, ignore_index=True)
         
+        st.session_state.total_eligible_stores = len(agg_final)
+        st.session_state.total_eligible_clusters = agg_final['Cluster'].nunique()
+        st.session_state.n_max_value_for_run = N_max
+        st.session_state.max_budget_value_for_run = f"Rp {max_budget:,.0f}"
+
         try:
             import pulp
         except ImportError:
@@ -201,22 +199,28 @@ if 'agg' in st.session_state:
 if 'selected_df' in st.session_state:
     st.header("✅ Hasil Seleksi Optimasi")
     selected_df = st.session_state.selected_df
-    total_estimated_budget = selected_df['Estimated_Cost'].sum()
-    total_score = selected_df['Score'].sum()
-    n_max_value = st.session_state.get('n_max_value_for_run', 'N/A')
-    max_budget_value = st.session_state.get('max_budget_value_for_run', 'N/A')
-    res_col1, res_col2 = st.columns(2)
-    res_col1.metric("Total Toko Terpilih", f"{len(selected_df)}", f"dari target maks. {n_max_value}")
-    res_col2.metric("Estimasi Budget Bulanan", f"Rp {total_estimated_budget:,.0f}", f"dari maks. {max_budget_value}")
+    
+    total_eligible_stores = st.session_state.get('total_eligible_stores', 1)
+    total_eligible_clusters = st.session_state.get('total_eligible_clusters', 1)
+    percent_selected = (len(selected_df) / total_eligible_stores) * 100 if total_eligible_stores > 0 else 0
+    unique_clusters_selected = selected_df['Cluster'].nunique()
+    percent_clusters = (unique_clusters_selected / total_eligible_clusters) * 100 if total_eligible_clusters > 0 else 0
+
+    res_col1, res_col2, res_col3 = st.columns(3)
+    res_col1.metric("Toko Terpilih", f"{len(selected_df)} ({percent_selected:.1f}%)", f"dari {total_eligible_stores} toko")
+    res_col2.metric("Cakupan Cluster", f"{unique_clusters_selected} ({percent_clusters:.0f}%)", f"dari {total_eligible_clusters} cluster")
+    res_col3.metric("Estimasi Budget Bulanan", f"Rp {selected_df['Estimated_Cost'].sum():,.0f}")
     
     st.markdown("---")
     st.header("📊 Analisis Kontribusi & Efisiensi")
     if not selected_df.empty:
+        total_score = selected_df['Score'].sum()
+        total_estimated_budget = selected_df['Estimated_Cost'].sum()
         selected_df['Kontribusi_Skor_%'] = (selected_df['Score'] / total_score * 100)
         selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / (total_estimated_budget + 1e-9) * 100)
         selected_df['Efisiensi (Skor per 1 Juta Biaya)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
         selected_df['ID_dan_Nama'] = selected_df['ID Toko'].astype(str) + ' - ' + selected_df['Nama Toko']
-
+        
         st.subheader("Kontribusi Teratas")
         c1, c2 = st.columns(2)
         with c1:
@@ -225,7 +229,7 @@ if 'selected_df' in st.session_state:
         with c2:
             st.write("**Top 10 Kontributor Budget**")
             st.bar_chart(selected_df.nlargest(10, 'Kontribusi_Budget_%'), x='ID_dan_Nama', y='Kontribusi_Budget_%')
-
+        
         st.subheader("Analisis Efisiensi (Value for Money)")
         chart = alt.Chart(selected_df).mark_circle().encode(
             x=alt.X('Estimated_Cost', title='Estimasi Biaya (Rp)'),
@@ -235,7 +239,7 @@ if 'selected_df' in st.session_state:
             size='Avg_Ton'
         ).interactive()
         st.altair_chart(chart, use_container_width=True)
-
+        
         st.subheader("Data Lengkap Toko Terpilih")
         st.dataframe(selected_df[[
             'ID Toko', 'Nama Toko', 'Cluster', 'Area', 'Score', 'Estimated_Cost', 
@@ -250,7 +254,7 @@ if 'selected_df' in st.session_state:
         excel_bytes = to_excel_bytes(selected_df)
         st.download_button("⬇️ Download Hasil Lengkap (Excel)", data=excel_bytes, file_name="analisis_optimasi_toko.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.balloons()
-
+    
     st.markdown("---")
     st.header("📈 Analisis Tren Performa Bulanan")
     if 'grouped' in st.session_state and not selected_df.empty:
@@ -261,7 +265,7 @@ if 'selected_df' in st.session_state:
         st.subheader("Tren Agregat (Semua Toko Terpilih)")
         agregat_trend = trend_data.groupby('Bulan')['Total_Ton'].sum().reset_index()
         st.line_chart(agregat_trend, x='Bulan', y='Total_Ton')
-
+        
         st.subheader("Perbandingan Tren per Toko")
         list_toko_terpilih = selected_df['Nama Toko'].unique().tolist()
         toko_untuk_dibandingkan = st.multiselect(
