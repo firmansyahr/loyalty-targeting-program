@@ -162,7 +162,7 @@ if 'agg' in st.session_state:
     if st.button("▶️ Jalankan Optimasi", type="primary"):
         agg_final = agg.copy()
         agg_final['Score'] = (w1*agg_final['Ratio_vs_Cluster'] + w2*normalize(agg_final['Avg_Trx']) + w3*normalize(agg_final['Ton_Growth']))
-        poin_to_rupiah = {'BRONZE': 10000, 'SILVER': 12500, 'GOLD': 15000, 'PLATINUM': 17500, 'SUPER PLATINUM': 20000}
+        poin_to_rupiah = {'BRONZE': 5000, 'SILVER': 5000, 'GOLD': 5000, 'PLATINUM': 6250, 'SUPER PLATINUM': 6250}
         agg_final['Rupiah_per_Poin'] = agg_final['Cluster'].str.upper().map(poin_to_rupiah).fillna(0)
         agg_final['Estimated_Cost'] = agg_final['Avg_Ton'] * agg_final['Rupiah_per_Poin']
         agg_final.sort_values('Score', ascending=False, inplace=True)
