@@ -10,7 +10,7 @@ import altair as alt
 # Konfigurasi halaman Streamlit
 st.set_page_config(page_title="Loyalty Target Optimizer", layout="wide")
 st.title("🔎 Loyalty Target Optimizer & Analyzer")
-st.markdown("Aplikasi untuk optimasi penargetan toko loyalitas dan analisis kontribusi dari toko-toko terpilih.")
+st.markdown("Aplikasi ini membantu memilih toko terbaik untuk program loyalitas berdasarkan performa, skor, dan batasan yang fleksibel (Area AP, Anggaran, Jumlah Toko, dan Batas Cluster)")
 
 # ------------- Fungsi Bantuan -------------
 def normalize(series):
