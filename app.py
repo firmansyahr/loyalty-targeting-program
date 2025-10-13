@@ -9,8 +9,8 @@ import altair as alt
 
 # Konfigurasi halaman Streamlit
 st.set_page_config(page_title="Loyalty Target Optimizer", layout="wide")
-st.title("🔎 Loyalty Target Optimizer & Analyzer")
-st.markdown("Aplikasi ini membantu memilih toko terbaik untuk program loyalitas berdasarkan performa, skor, dan batasan yang fleksibel (Area AP, Anggaran, Jumlah Toko, dan Batas Cluster)")
+st.title("🔎 Loyalty Program Optimizer & Analyzer")
+st.markdown("Aplikasi ini membantu memilih toko terbaik untuk program loyalty berdasarkan performa, skor, dan batasan yang fleksibel (Area AP, Anggaran, Jumlah Toko, dan Batas Cluster)")
 
 # ------------- Fungsi Bantuan -------------
 def normalize(series):
@@ -263,7 +263,7 @@ if 'selected_df' in st.session_state:
         
         excel_bytes = to_excel_bytes(selected_df)
         st.download_button("⬇️ Download Hasil Lengkap (Excel)", data=excel_bytes, file_name="analisis_optimasi_toko.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.balloons()
+        
     
     st.markdown("---")
     st.header("📈 Analisis Tren Performa Bulanan")
