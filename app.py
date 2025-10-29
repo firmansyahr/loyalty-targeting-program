@@ -59,7 +59,7 @@ if uploaded_file:
                 required_cols = [
                     'Tanggal Transaksi', 'ID Toko', 'Nama Toko', 'Cluster Pareto', 
                     'Area AP Toko', 'Provinsi Toko', 'Area Toko', 'Brands', 
-                    'Nama Produk', 'Total Ton'
+                    'Nama Produk', 'TON Quantity'
                 ]
                 
                 if not all(c in df_raw.columns for c in required_cols):
@@ -72,7 +72,7 @@ if uploaded_file:
                 df = df_raw[df_raw['Brands'].isin(selected_brands)].copy()
                 
                 # Imputasi Nilai Kosong
-                df['Total Ton'].fillna(0, inplace=True)
+                df['TON Quantity'].fillna(0, inplace=True)
                 df['Tanggal Transaksi'] = pd.to_datetime(df['Tanggal Transaksi'], errors='coerce')
                 df.dropna(subset=['Tanggal Transaksi'], inplace=True)
 
@@ -96,7 +96,7 @@ if uploaded_file:
                 df['Bulan'] = df['Tanggal Transaksi'].dt.to_period('M').astype(str)
                 
                 # --- MODIFIKASI: Menambahkan kolom baru ke groupby ---
-                grouped = df.groupby(['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko', 'Bulan']).agg(Total_Ton=('Total Ton', 'sum'), Jumlah_Transaksi=('Tanggal Transaksi', 'count')).reset_index()
+                grouped = df.groupby(['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko', 'Bulan']).agg(Total_Ton=('TON Quantity', 'sum'), Jumlah_Transaksi=('Tanggal Transaksi', 'count')).reset_index()
                 agg = grouped.groupby(['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko']).agg(Avg_Ton=('Total_Ton', 'mean'), Avg_Trx=('Jumlah_Transaksi', 'mean')).reset_index()
                 
                 growths = []
