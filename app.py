@@ -516,13 +516,13 @@ if 'selected_df' in st.session_state:
                 ('Efisiensi (Skor/Juta)', 'Efisiensi', '{:,.2f}'),
             ]
 
-            for col_ui, row in zip(cols_compare, compare_df.itertuples()):
+            for col_ui, (_, row) in zip(cols_compare, compare_df.iterrows()):
                 with col_ui:
-                    st.markdown(f"### 🏪 {row._asdict()['Nama Toko']}")
-                    st.markdown(f"**ID:** {row._asdict()['ID Toko']}  \n**Cluster:** {row._asdict()['Cluster Pareto']}  \n**Provinsi:** {row._asdict()['Provinsi Toko']}  \n**Area AP:** {row._asdict()['Area AP Toko']}")
+                    st.markdown(f"### 🏪 {row['Nama Toko']}")
+                    st.markdown(f"**ID:** {row['ID Toko']}  \n**Cluster:** {row['Cluster Pareto']}  \n**Provinsi:** {row['Provinsi Toko']}  \n**Area AP:** {row['Area AP Toko']}")
                     st.markdown("---")
                     for field, label, fmt in metrics_to_show:
-                        val = row._asdict().get(field, 'N/A')
+                        val = row.get(field, 'N/A') if hasattr(row, 'get') else row[field] if field in row.index else 'N/A'
                         if isinstance(val, (int, float)):
                             st.metric(label, fmt.format(val))
                         else:
