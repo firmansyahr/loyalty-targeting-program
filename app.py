@@ -595,9 +595,11 @@ if 'selected_df' in st.session_state:
             st.altair_chart(tline, use_container_width=True)
 
             st.subheader("Tren per Cluster Pareto")
-            cluster_trend = trend_data.merge(
-                selected_df[['ID Toko', 'Cluster Pareto']], on='ID Toko', how='left'
-            ).groupby(['Bulan', 'Cluster Pareto'])['Total_Ton'].sum().reset_index()
+            sel_cluster = selected_df[['ID Toko', 'Cluster Pareto']].drop_duplicates(subset=['ID Toko']).copy()
+            trend_merged = trend_data.drop(columns=['Cluster Pareto'], errors='ignore').merge(
+                sel_cluster, on='ID Toko', how='left'
+            ).dropna(subset=['Cluster Pareto'])
+            cluster_trend = trend_merged.groupby(['Bulan', 'Cluster Pareto'])['Total_Ton'].sum().reset_index()
             cluster_trend_chart = alt.Chart(cluster_trend).mark_line(point=True).encode(
                 x=alt.X('Bulan:N', sort=None),
                 y=alt.Y('Total_Ton:Q', title='Total Tonase'),
