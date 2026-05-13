@@ -6,12 +6,11 @@ from datetime import datetime
 import math
 import altair as alt
 
-# Konfigurasi halaman Streamlit
+# ============================================================
+# 1. KONFIGURASI HALAMAN & CUSTOM CSS
+# ============================================================
 st.set_page_config(page_title="Loyalty Target Optimizer", layout="wide", page_icon="🎯")
 
-# ============================================================
-# Custom CSS
-# ============================================================
 st.markdown("""
 <style>
     .stMetric { background: #f0f4ff; border-radius: 10px; padding: 10px; }
@@ -30,16 +29,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🎯 B2B Loyalty Program Optimizer")
-st.markdown("Aplikasi membantu memilih toko terbaik untuk program loyalty berdasarkan *Multi-Criteria Scoring* dan *Integer Linear Programming*.")
+st.markdown("Aplikasi pemilihan toko terbaik untuk program loyalty menggunakan **Multi-Criteria Scoring** dan **Integer Linear Programming (ILP)**.")
 
 # ============================================================
-# Konstanta Bisnis
+# 2. KONSTANTA BISNIS & FUNGSI BANTUAN
 # ============================================================
 FB_PROVINCES = ['Kalimantan Timur', 'Kalimantan Utara', 'Sulawesi Tengah', 'Sulawesi Selatan']
 
-# ============================================================
-# Fungsi Bantuan
-# ============================================================
 def normalize(series):
     return (series - series.min()) / (series.max() - series.min() + 1e-9)
 
@@ -50,6 +46,7 @@ def to_excel_bytes_multi(selected_df, summary_df, trend_df=None):
         summary_df.to_excel(writer, index=False, sheet_name='Ringkasan Cluster')
         if trend_df is not None and not trend_df.empty:
             trend_df.to_excel(writer, index=False, sheet_name='Tren Bulanan')
+        
         meta = pd.DataFrame({
             'Keterangan': ['Tanggal Export', 'Total Toko Terpilih', 'Total Estimasi Budget'],
             'Nilai': [
@@ -61,6 +58,16 @@ def to_excel_bytes_multi(selected_df, summary_df, trend_df=None):
         meta.to_excel(writer, index=False, sheet_name='Metadata')
     return output.getvalue()
 
+def compute_scores(agg_df, w1, w2, w3):
+    temp = agg_df.copy()
+    temp['Score'] = (w1 * temp['Ratio_vs_Cluster'] + 
+                     w2 * normalize(temp['Avg_Trx']) + 
+                     w3 * normalize(temp['Ton_Growth']))
+    return temp
+
+# ============================================================
+# 3. FUNGSI PEMROSESAN DATA (CACHE)
+# ============================================================
 @st.cache_data
 def load_and_preprocess(uploaded_file):
     fname = uploaded_file.name.lower()
@@ -74,7 +81,7 @@ def load_and_preprocess(uploaded_file):
     df = df_raw.dropna(subset=['Tanggal Transaksi']).copy()
     df['TON Quantity'] = df['TON Quantity'].fillna(0)
     
-    # 1. Logika Kategori Brand (Sesuai Aturan Perusahaan)
+    # Aturan Kategori Brand
     def get_brand_category(row):
         area = str(row['Area AP Toko']).strip().upper()
         prov = str(row['Provinsi Toko']).strip()
@@ -95,7 +102,7 @@ def load_and_preprocess(uploaded_file):
     df['Brand_Category'] = df.apply(get_brand_category, axis=1)
     df = df[df['Brand_Category'] != 'Other'].copy()
     
-    # 2. Logika Reward Cost Aktual
+    # Aturan Estimasi Biaya (Reward Rate)
     def calculate_reward_rate(cluster, brand_cat):
         if str(cluster).strip().upper() in ['PLATINUM', 'SUPER PLATINUM']:
             mb_rate = 3750
@@ -103,7 +110,7 @@ def load_and_preprocess(uploaded_file):
             mb_rate = 2500
             
         if brand_cat == 'Main Brand': return mb_rate
-        elif brand_cat in ['Companion Brand', 'Fighting Brand']: return mb_rate / 2 # Rasio 2:1
+        elif brand_cat in ['Companion Brand', 'Fighting Brand']: return mb_rate / 2
         else: return 0
 
     df['Reward_Rate'] = df.apply(lambda r: calculate_reward_rate(r['Cluster Pareto'], r['Brand_Category']), axis=1)
@@ -122,7 +129,7 @@ def build_aggregation(df_input):
     agg = (monthly.groupby(['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko'])
            .agg(Avg_Ton=('Total_Ton', 'mean'), Avg_Trx=('Jumlah_Trx', 'mean'), Total_Bulan_Aktif=('Bulan', 'nunique')).reset_index())
 
-    # Mencegah Survivorship Bias (Growth)
+    # Menghitung Pertumbuhan (Growth) menghindari Survivorship Bias
     growths = []
     for sid in agg['ID Toko']:
         td = monthly[monthly['ID Toko'] == sid]
@@ -133,7 +140,7 @@ def build_aggregation(df_input):
         growths.append((last_val - prev_mean) / prev_mean if prev_mean > 0 else 0.0)
     agg['Ton_Growth'] = growths
 
-    # Hitung Estimasi Cost Bulanan yg Presisi (Berdasarkan Kategori Brand & Cluster Aktual)
+    # Total Estimasi Biaya per Bulan
     cost_total = df_input.groupby('ID Toko')['Biaya_Reward_Transaksi'].sum().reset_index()
     cost_total = cost_total.merge(agg[['ID Toko', 'Total_Bulan_Aktif']], on='ID Toko')
     cost_total['Estimated_Cost'] = cost_total['Biaya_Reward_Transaksi'] / cost_total['Total_Bulan_Aktif']
@@ -141,22 +148,18 @@ def build_aggregation(df_input):
     agg = agg.merge(cost_total[['ID Toko', 'Estimated_Cost']], on='ID Toko', how='left')
     agg['Estimated_Cost'] = agg['Estimated_Cost'].fillna(0)
 
+    # Ratio vs Cluster
     cluster_avg = agg.groupby('Cluster Pareto')['Avg_Ton'].mean().to_dict()
     agg['Ratio_vs_Cluster'] = agg.apply(lambda x: x['Avg_Ton'] / cluster_avg.get(x['Cluster Pareto'], 1.0), axis=1)
 
     return agg, monthly
 
-def compute_scores(agg_df, w1, w2, w3):
-    temp = agg_df.copy()
-    temp['Score'] = (w1 * temp['Ratio_vs_Cluster'] + w2 * normalize(temp['Avg_Trx']) + w3 * normalize(temp['Ton_Growth']))
-    return temp
-
 # ============================================================
-# LANGKAH 1: UPLOAD & PROSES DATA
+# 4. ANTARMUKA PENGGUNA (UI)
 # ============================================================
 st.markdown('<div class="section-header">📁 Langkah 1: Upload & Proses Data Awal</div>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader("📤 Upload file transaksi (Hanya .parquet disarankan)", type=["parquet"])
+uploaded_file = st.file_uploader("📤 Upload file transaksi (Hanya disarankan .parquet)", type=["parquet"])
 
 if uploaded_file:
     col1, col2 = st.columns([3, 1])
@@ -180,15 +183,14 @@ if uploaded_file:
 
 st.markdown("---")
 
-# ============================================================
-# LANGKAH 2: FILTER & OPTIMASI (Sidebar + Main)
-# ============================================================
 if 'agg' in st.session_state:
     base_agg = st.session_state.agg
 
-    # ---- Sidebar: Kontrol Parameter ----
+    # ============================================================
+    # PANEL KONTROL SIDEBAR
+    # ============================================================
     with st.sidebar:
-        st.markdown("## 🛠️ Panel Kontrol")
+        st.markdown("## 🛠️ Panel Kontrol ILP")
         
         st.markdown("### 📍 Filter Geografis")
         available_areas_ap = sorted(base_agg['Area AP Toko'].unique())
@@ -204,14 +206,14 @@ if 'agg' in st.session_state:
         total_available = agg.shape[0]
         N_max = st.number_input("Jumlah Toko Maks (N_max)", 1, max(1, total_available), value=min(1700, total_available), step=10)
 
-        st.markdown("### ⚖️ Bobot Skor (Default: Spearman)")
-        w_ratio = st.slider("Ratio_vs_Cluster (%)", 0, 100, 47)
-        w_trx   = st.slider("Avg_Trx (%)", 0, 100, 41)
-        w_growth = st.slider("Ton_Growth (%)", 0, 100, 12)
+        st.markdown("### ⚖️ Bobot Skor (Default Spearman)")
+        w_ratio = st.slider("Ratio vs Cluster (%)", 0, 100, 47)
+        w_trx   = st.slider("Avg Transaksi (%)", 0, 100, 41)
+        w_growth = st.slider("Tonase Growth (%)", 0, 100, 12)
         total_w = w_ratio + w_trx + w_growth
         w1, w2, w3 = w_ratio/max(total_w,1), w_trx/max(total_w,1), w_growth/max(total_w,1)
 
-        st.markdown("### 🎯 Batas Maks Cluster (Skenario Mirror)")
+        st.markdown("### 🎯 Batas Maks Cluster (Constraint)")
         cluster_pcts_existing = agg['Cluster Pareto'].value_counts(normalize=True).mul(100).to_dict()
         cluster_pct_inputs = {}
         for c in sorted(agg['Cluster Pareto'].unique()):
@@ -221,15 +223,17 @@ if 'agg' in st.session_state:
 
         run_optimize = st.button("▶️ Jalankan Optimasi ILP", type="primary", use_container_width=True)
 
-    # ---- Main: Simulasi & Optimasi ----
+    # ============================================================
+    # MAIN AREA: SIMULASI WHAT-IF
+    # ============================================================
     st.markdown(f'<div class="info-box">🗂️ <b>{agg.shape[0]:,} toko</b> siap dioptimasi (Filter: Aktif {min_bulan_aktif} bulan).</div>', unsafe_allow_html=True)
     
     with st.expander("🔮 Simulasi What-If: Preview Distribusi Skor"):
-        st.markdown("Distribusi skor toko berdasarkan bobot saat ini di sidebar.")
+        st.markdown("Melihat distribusi skor toko berdasarkan pengaturan bobot di sidebar (sebelum ILP dieksekusi).")
         if not agg.empty:
             preview_df = compute_scores(agg, w1, w2, w3)
             hist_chart = alt.Chart(preview_df).mark_bar(opacity=0.8).encode(
-                x=alt.X('Score:Q', bin=alt.Bin(maxbins=30), title='Distribusi Skor'),
+                x=alt.X('Score:Q', bin=alt.Bin(maxbins=30), title='Distribusi Skor Komposit'),
                 y=alt.Y('count()', title='Jumlah Toko'),
                 color=alt.Color('Cluster Pareto:N'),
                 tooltip=['Cluster Pareto', 'count()']
@@ -237,7 +241,7 @@ if 'agg' in st.session_state:
             st.altair_chart(hist_chart, use_container_width=True)
 
     # ============================================================
-    # JALANKAN ILP
+    # EKSEKUSI ILP (PULP)
     # ============================================================
     if run_optimize:
         agg_final = compute_scores(agg, w1, w2, w3)
@@ -249,21 +253,27 @@ if 'agg' in st.session_state:
         try:
             import pulp
         except ImportError:
-            st.error("Library 'pulp' tidak ditemukan. Jalankan: pip install pulp")
+            st.error("Library 'pulp' tidak ditemukan. Silakan jalankan `pip install pulp`.")
             st.stop()
 
         with st.spinner("Menjalankan solver Integer Linear Programming..."):
             prob = pulp.LpProblem("Loyalty_Selection", pulp.LpMaximize)
             x_vars = {row['ID Toko']: pulp.LpVariable(f"x_{row['ID Toko']}", cat='Binary') for _, row in agg_final.iterrows()}
             
+            # Objective: Maximize Score
             prob += pulp.lpSum([row['Score'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()])
+            
+            # Constraint 1: N_max
             prob += pulp.lpSum(x_vars.values()) <= int(N_max)
+            
+            # Constraint 2: Budget
             prob += pulp.lpSum([row['Estimated_Cost'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()]) <= max_budget
 
+            # Constraint 3: Cluster Proportions
             for cluster_name, max_pct in cluster_pct_inputs.items():
                 if max_pct > 0:
                     members = agg_final[agg_final['Cluster Pareto'] == cluster_name]['ID Toko'].tolist()
-                    cap = int(math.ceil((max_pct / 100.0) * float(N_max))) # Menggunakan ceil
+                    cap = int(math.ceil((max_pct / 100.0) * float(N_max))) 
                     if members:
                         prob += pulp.lpSum([x_vars[sid] for sid in members]) <= cap
 
@@ -271,11 +281,11 @@ if 'agg' in st.session_state:
             selected_ids = [str(sid) for sid, var in x_vars.items() if pulp.value(var) == 1]
             
             st.session_state.selected_df = agg_final[agg_final['ID Toko'].isin(selected_ids)].sort_values('Score', ascending=False, ignore_index=True)
-            st.success(f"✅ Optimasi selesai! {len(selected_ids):,} toko terpilih.")
+            st.success(f"✅ Optimasi selesai! ILP berhasil memilih {len(selected_ids):,} toko terbaik.")
             st.balloons()
 
 # ============================================================
-# HASIL & ANALISIS
+# 5. DASHBOARD HASIL & ANALISIS
 # ============================================================
 if 'selected_df' in st.session_state:
     selected_df = st.session_state.selected_df
@@ -284,11 +294,16 @@ if 'selected_df' in st.session_state:
     budget_max = st.session_state.get('max_budget_value_for_run', 1)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Ringkasan & Komposisi", "📈 Analisis Kontribusi", "🔍 Perbandingan Toko", "📅 Tren Bulanan", "📋 Data & Export"
+        "📊 Ringkasan & Komposisi", 
+        "📈 Analisis Kontribusi", 
+        "🔍 Perbandingan Toko", 
+        "📅 Tren Bulanan", 
+        "📋 Data & Export"
     ])
 
     # --- TAB 1: RINGKASAN ---
     with tab1:
+        st.markdown('<div class="section-header">📊 Ringkasan Hasil ILP</div>', unsafe_allow_html=True)
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Toko Terpilih", f"{len(selected_df):,}", f"Dari total {total_eligible_stores:,}")
         m2.metric("Total Proyeksi Tonase", f"{selected_df['Avg_Ton'].sum():,.1f} Ton")
@@ -300,7 +315,102 @@ if 'selected_df' in st.session_state:
             st.subheader("Distribusi Cluster Pareto")
             cluster_summary = selected_df['Cluster Pareto'].value_counts().reset_index()
             cluster_summary.columns = ['Cluster', 'Jumlah']
+            
+            # KODE GRAFIK PIE YANG SUDAH DIPERBAIKI
             pie_chart = alt.Chart(cluster_summary).mark_arc(innerRadius=50).encode(
-                theta=alt.Theta('Jumlah:Q'), color=alt.Color('Cluster:N'), tooltip=['Cluster', 'Jumlah']
+                theta=alt.Theta('Jumlah:Q'), 
+                color=alt.Color('Cluster:N'), 
+                tooltip=['Cluster', 'Jumlah']
             )
-            st.altair_chart(pie
+            st.altair_chart(pie_chart, use_container_width=True)
+            
+        with cc2:
+            st.subheader("Distribusi Geografis (Area AP)")
+            area_dist = selected_df['Area AP Toko'].value_counts().reset_index()
+            area_dist.columns = ['Area AP', 'Jumlah']
+            
+            area_chart = alt.Chart(area_dist).mark_bar(color='#FF6B6B').encode(
+                x=alt.X('Jumlah:Q'), 
+                y=alt.Y('Area AP:N', sort='-x'), 
+                tooltip=['Area AP', 'Jumlah']
+            )
+            st.altair_chart(area_chart, use_container_width=True)
+
+    # --- TAB 2: ANALISIS KONTRIBUSI ---
+    with tab2:
+        st.markdown('<div class="section-header">📈 Analisis Efisiensi Portofolio</div>', unsafe_allow_html=True)
+        selected_df['Efisiensi (Skor/Juta)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
+        
+        st.subheader("Scatter: Skor vs Estimasi Biaya")
+        chart_scatter = alt.Chart(selected_df).mark_circle().encode(
+            x=alt.X('Estimated_Cost:Q', title='Estimasi Biaya Reward (Rp)'),
+            y=alt.Y('Score:Q', title='Skor Performa ILP'),
+            color=alt.Color('Cluster Pareto:N'),
+            size=alt.Size('Avg_Ton:Q', title='Tonase'),
+            tooltip=['Nama Toko', 'Cluster Pareto', 'Score', 'Estimated_Cost', 'Efisiensi (Skor/Juta)']
+        ).interactive().properties(height=350)
+        st.altair_chart(chart_scatter, use_container_width=True)
+
+    # --- TAB 3: PERBANDINGAN TOKO ---
+    with tab3:
+        st.markdown('<div class="section-header">🔍 Perbandingan Toko Terpilih</div>', unsafe_allow_html=True)
+        all_toko_options = (selected_df['ID Toko'] + ' — ' + selected_df['Nama Toko']).tolist()
+        toko_dipilih = st.multiselect("Pilih maksimal 4 toko:", all_toko_options, default=all_toko_options[:min(3, len(all_toko_options))], max_selections=4)
+        
+        if toko_dipilih:
+            ids_dipilih = [t.split(' — ')[0] for t in toko_dipilih]
+            compare_df = selected_df[selected_df['ID Toko'].isin(ids_dipilih)].copy()
+            cols_compare = st.columns(len(compare_df))
+            for col_ui, (_, row) in zip(cols_compare, compare_df.iterrows()):
+                with col_ui:
+                    st.markdown(f"### 🏪 {row['Nama Toko']}")
+                    st.markdown(f"**Cluster:** {row['Cluster Pareto']} | **Provinsi:** {row['Provinsi Toko']}")
+                    st.metric("Skor Komposit", f"{row['Score']:.4f}")
+                    st.metric("Avg Tonase", f"{row['Avg_Ton']:.1f} Ton")
+                    st.metric("Estimasi Biaya", f"Rp {row['Estimated_Cost']:,.0f}")
+                    st.metric("Tonase Growth", f"{row['Ton_Growth']:.1%}")
+
+    # --- TAB 4: TREN BULANAN ---
+    with tab4:
+        st.markdown('<div class="section-header">📅 Analisis Tren Historis</div>', unsafe_allow_html=True)
+        if 'grouped' in st.session_state:
+            g_data = st.session_state.grouped.copy()
+            g_data['ID Toko'] = g_data['ID Toko'].astype(str)
+            trend_data = g_data[g_data['ID Toko'].isin(selected_df['ID Toko'])]
+            
+            agg_trend = trend_data.groupby('Bulan').agg(Total_Ton=('Total_Ton', 'sum')).reset_index()
+            tline = alt.Chart(agg_trend).mark_line(point=True, color='#1976D2', strokeWidth=3).encode(
+                x=alt.X('Bulan:N', sort=None), 
+                y=alt.Y('Total_Ton:Q', title='Total Tonase Terpilih')
+            ).properties(height=350, title="Total Tonase Keseluruhan Toko Terpilih (Jan 25 - Mar 26)")
+            st.altair_chart(tline, use_container_width=True)
+
+    # --- TAB 5: DATA LENGKAP & EXPORT ---
+    with tab5:
+        st.markdown('<div class="section-header">📋 Tabel Data & Export Laporan</div>', unsafe_allow_html=True)
+        show_cols = ['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Provinsi Toko', 'Area AP Toko', 'Avg_Ton', 'Score', 'Estimated_Cost', 'Efisiensi (Skor/Juta)']
+        st.dataframe(selected_df[show_cols].style.format({'Estimated_Cost': 'Rp {:,.0f}', 'Efisiensi (Skor/Juta)': '{:,.2f}', 'Score': '{:.4f}', 'Avg_Ton': '{:.1f}'}), use_container_width=True)
+        
+        st.markdown("---")
+        # Fungsi Export
+        excel_bytes = to_excel_bytes_multi(selected_df[show_cols], selected_df['Cluster Pareto'].value_counts().reset_index())
+        
+        c_exp1, c_exp2 = st.columns(2)
+        with c_exp1:
+            st.download_button(
+                "📊 Download Laporan (Excel)", 
+                data=excel_bytes, 
+                file_name=f"optimasi_loyalty_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", 
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        with c_exp2:
+            parquet_buffer = BytesIO()
+            selected_df[show_cols].to_parquet(parquet_buffer, index=False)
+            st.download_button(
+                "🗜️ Download Raw Data (Parquet)", 
+                data=parquet_buffer.getvalue(), 
+                file_name=f"optimasi_loyalty_raw_{datetime.now().strftime('%Y%m%d_%H%M')}.parquet", 
+                mime="application/octet-stream",
+                use_container_width=True
+            )
