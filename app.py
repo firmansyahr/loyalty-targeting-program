@@ -1,1413 +1,1088 @@
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║   LOYALTY STORE SELECTION OPTIMIZER                                  ║
+║   Incorporating Research Best Practices:                             ║
+║   • Spearman-based data-driven weights (validated)                   ║
+║   • Province-level brand categorization                              ║
+║   • Correct Ton_Growth (survivorship-corrected, anchored to T_max)   ║
+║   • Correct Estimated_Cost (brand-mix weighted per cluster)          ║
+║   • math.ceil() on cluster caps (not floor)                          ║
+║   • ILP-A Mirror as recommended method                               ║
+║   • Self-calibrating budget from existing roster                     ║
+║   • Jaccard robustness check on sensitivity                          ║
+║                                                                      ║
+║   Run: streamlit run app_loyalty_optimizer.py                        ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
 import streamlit as st
-
 import pandas as pd
-
 import numpy as np
-
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pulp
+import math
+import warnings
+from scipy.stats import spearmanr
 from io import BytesIO
-
 from datetime import datetime
 
-import math
-
-import altair as alt
-
-
-
-# Konfigurasi halaman Streamlit
-
-st.set_page_config(page_title="Loyalty Target Optimizer", layout="wide", page_icon="🎯")
-
-
-
-# ============================================================
-
-# Custom CSS untuk tampilan yang lebih baik
-
-# ============================================================
-
-st.markdown("""
-
-<style>
-
-    .stMetric { background: #f0f4ff; border-radius: 10px; padding: 10px; }
-
-    .block-container { padding-top: 1.5rem; }
-
-    div[data-testid="stSidebar"] { background: #1a1a2e; color: white; }
-
-    div[data-testid="stSidebar"] .stMarkdown { color: #ccc; }
-
-    .section-header {
-
-        background: linear-gradient(90deg, #1a1a2e, #16213e);
-
-        color: white; padding: 12px 20px; border-radius: 10px;
-
-        margin: 1rem 0 0.5rem 0; font-weight: 600;
-
-    }
-
-    .info-box { background: #e8f4fd; padding: 12px; border-left: 4px solid #2196F3; border-radius: 5px; }
-
-    .warning-box { background: #fff8e1; padding: 12px; border-left: 4px solid #FF9800; border-radius: 5px; }
-
-    .success-box { background: #e8f5e9; padding: 12px; border-left: 4px solid #4CAF50; border-radius: 5px; }
-
-</style>
-
-""", unsafe_allow_html=True)
-
-
-
-st.title("🎯 Loyalty Program Optimizer & Analyzer")
-
-st.markdown("Aplikasi membantu memilih toko terbaik untuk program loyalty berdasarkan performa, skor, dan batasan yang fleksibel.")
-
-
-
-# ============================================================
-
-# Fungsi Bantuan
-
-# ============================================================
-
-def normalize(series):
-
-    return (series - series.min()) / (series.max() - series.min() + 1e-9)
-
-
-
-def to_excel_bytes_multi(selected_df, summary_df, trend_df=None):
-
-    """Export multi-sheet Excel."""
-
-    output = BytesIO()
-
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-
-        selected_df.to_excel(writer, index=False, sheet_name='Toko Terpilih')
-
-        summary_df.to_excel(writer, index=False, sheet_name='Ringkasan Cluster')
-
-        if trend_df is not None and not trend_df.empty:
-
-            trend_df.to_excel(writer, index=False, sheet_name='Tren Bulanan')
-
-        # Sheet metadata
-
-        meta = pd.DataFrame({
-
-            'Keterangan': ['Tanggal Export', 'Total Toko Terpilih', 'Total Estimasi Budget'],
-
-            'Nilai': [
-
-                datetime.now().strftime('%Y-%m-%d %H:%M'),
-
-                len(selected_df),
-
-                f"Rp {selected_df['Estimated_Cost'].sum():,.0f}" if 'Estimated_Cost' in selected_df.columns else '-'
-
-            ]
-
-        })
-
-        meta.to_excel(writer, index=False, sheet_name='Metadata')
-
-    return output.getvalue()
-
-
-
-def read_uploaded_file(uploaded_file):
-
-    """Baca file: CSV, XLSX, atau Parquet."""
-
-    fname = uploaded_file.name.lower()
-
-    if fname.endswith(".csv"):
-
-        return pd.read_csv(uploaded_file, dtype={'ID Toko': str})
-
-    elif fname.endswith(".xlsx") or fname.endswith(".xls"):
-
-        return pd.read_excel(uploaded_file, dtype={'ID Toko': str})
-
-    elif fname.endswith(".parquet"):
-
-        df = pd.read_parquet(uploaded_file)
-
-        if 'ID Toko' in df.columns:
-
-            df['ID Toko'] = df['ID Toko'].astype(str)
-
-        return df
-
-    else:
-
-        raise ValueError(f"Format file tidak didukung: {uploaded_file.name}")
-
-
-
-def compute_scores(agg_df, w1, w2, w3):
-
-    """Hitung skor berdasarkan bobot."""
-
-    temp = agg_df.copy()
-
-    temp['Score'] = (
-
-        w1 * temp['Ratio_vs_Cluster'] +
-
-        w2 * normalize(temp['Avg_Trx']) +
-
-        w3 * normalize(temp['Ton_Growth'])
-
-    )
-
-    return temp
-
-
-
-# ============================================================
-
-# LANGKAH 1: UPLOAD & PROSES DATA
-
-# ============================================================
-
-st.markdown('<div class="section-header">📁 Langkah 1: Upload & Proses Data Awal</div>', unsafe_allow_html=True)
-
-
-
-uploaded_file = st.file_uploader(
-
-    "📤 Upload file transaksi",
-
-    type=["csv", "xlsx", "xls", "parquet"],
-
-    help="Format yang didukung: CSV, Excel (.xlsx/.xls), dan Parquet"
-
+warnings.filterwarnings('ignore')
+
+# ════════════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Loyalty Store Optimizer",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-
-
-if uploaded_file:
-
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-
-        try:
-
-            if 'df_raw' not in st.session_state or st.session_state.get('uploaded_filename') != uploaded_file.name:
-
-                st.session_state.df_raw = read_uploaded_file(uploaded_file)
-
-                st.session_state.uploaded_filename = uploaded_file.name
-
-
-
-            df_raw = st.session_state.df_raw
-
-
-
-            # Info file
-
-            file_size_kb = uploaded_file.size / 1024
-
-            ext = uploaded_file.name.split('.')[-1].upper()
-
-            st.markdown(f'<div class="info-box">📄 <b>{uploaded_file.name}</b> — {ext} | {df_raw.shape[0]:,} baris × {df_raw.shape[1]} kolom | {file_size_kb:.1f} KB</div>', unsafe_allow_html=True)
-
-
-
-            available_brands = sorted(df_raw['Brands'].dropna().unique())
-
-            selected_brands = st.multiselect(
-
-                "🏷️ Pilih Brand",
-
-                available_brands,
-
-                default=[b for b in ["SEMEN GRESIK", "DYNAMIX", "MERDEKA"] if b in available_brands]
-
-            )
-
-            st.session_state.selected_brands = selected_brands
-
-        except Exception as e:
-
-            st.error(f"Gagal membaca file: {e}")
-
-            st.stop()
-
-
-
-    with col2:
-
-        st.write("👇 Setelah pilih brand, klik:")
-
-        if st.button("⚙️ Proses Data & Hitung Skor", type="primary"):
-
-            with st.spinner("Memproses data..."):
-
-                df_raw = st.session_state.df_raw
-
-                selected_brands = st.session_state.selected_brands
-
-
-
-                required_cols = [
-
-                    'Tanggal Transaksi', 'ID Toko', 'Nama Toko', 'Cluster Pareto',
-
-                    'Area AP Toko', 'Provinsi Toko', 'Area Toko', 'Brands',
-
-                    'Nama Produk', 'TON Quantity'
-
-                ]
-
-                if not all(c in df_raw.columns for c in required_cols):
-
-                    missing = [c for c in required_cols if c not in df_raw.columns]
-
-                    st.error(f"Kolom wajib hilang: {missing}")
-
-                    st.stop()
-
-                if not selected_brands:
-
-                    st.warning("Pilih minimal 1 brand.")
-
-                    st.stop()
-
-
-
-                df = df_raw[df_raw['Brands'].isin(selected_brands)].copy()
-
-                df['TON Quantity'] = df['TON Quantity'].fillna(0)
-
-                df['Tanggal Transaksi'] = pd.to_datetime(df['Tanggal Transaksi'], errors='coerce')
-
-                df.dropna(subset=['Tanggal Transaksi'], inplace=True)
-
-                df.sort_values(by=['ID Toko', 'Tanggal Transaksi'], inplace=True)
-
-
-
-                categorical_cols = ['Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko', 'Brands', 'Nama Produk']
-
-                for col in categorical_cols:
-
-                    if col in df.columns:
-
-                        df[col] = df.groupby('ID Toko')[col].transform(lambda x: x.ffill().bfill())
-
-
-
-                df.dropna(subset=['Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko'], inplace=True)
-
-
-
-                if df.empty:
-
-                    st.warning("Tidak ada data yang valid setelah dibersihkan.")
-
-                    st.stop()
-
-
-
-                df['Bulan'] = df['Tanggal Transaksi'].dt.to_period('M').astype(str)
-
-
-
-                grouped = df.groupby(
-
-                    ['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko', 'Bulan']
-
-                ).agg(
-
-                    Total_Ton=('TON Quantity', 'sum'),
-
-                    Jumlah_Transaksi=('Tanggal Transaksi', 'count')
-
-                ).reset_index()
-
-
-
-                agg = grouped.groupby(
-
-                    ['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko']
-
-                ).agg(
-
-                    Avg_Ton=('Total_Ton', 'mean'),
-
-                    Avg_Trx=('Jumlah_Transaksi', 'mean'),
-
-                    Total_Bulan_Aktif=('Bulan', 'nunique')
-
-                ).reset_index()
-
-
-
-                growths = []
-
-                for sid in agg['ID Toko']:
-
-                    toko_data = grouped[grouped['ID Toko'] == sid].sort_values('Bulan')
-
-                    if len(toko_data) >= 2:
-
-                        prev_mean = toko_data['Total_Ton'].iloc[:-1].mean()
-
-                        last_val = toko_data['Total_Ton'].iloc[-1]
-
-                        growth = (last_val - prev_mean) / prev_mean if prev_mean > 0 else 0.0
-
-                    else:
-
-                        growth = 0.0
-
-                    growths.append(growth)
-
-                agg['Ton_Growth'] = growths
-
-
-
-                cluster_avg = agg.groupby('Cluster Pareto')['Avg_Ton'].mean().to_dict()
-
-                agg['Ratio_vs_Cluster'] = agg.apply(
-
-                    lambda x: x['Avg_Ton'] / cluster_avg.get(x['Cluster Pareto'], 1.0), axis=1
-
-                )
-
-
-
-                st.session_state.agg = agg
-
-                st.session_state.df = df
-
-                st.session_state.grouped = grouped
-
-                st.success(f"✅ Data berhasil diproses! {agg.shape[0]:,} toko unik ditemukan.")
-
-
+st.markdown("""
+<style>
+    html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', sans-serif; }
+    .stApp { background: #F8FAFC; }
+    [data-testid="stSidebar"] { background: #1E2A3A; }
+    [data-testid="stSidebar"] .stMarkdown { color: #9EAFC2; }
+    [data-testid="stSidebar"] label { color: #C8D8E8 !important; }
+    [data-testid="metric-container"] {
+        background: white; border: 1px solid #E2E8F0;
+        border-radius: 12px; padding: 16px;
+    }
+    .section-hdr {
+        font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+        text-transform: uppercase; color: #3B82F6;
+        border-bottom: 1px solid #E2E8F0; padding-bottom: 8px; margin-bottom: 16px;
+    }
+    .card {
+        background: white; border: 1px solid #E2E8F0;
+        border-radius: 12px; padding: 18px 20px; margin-bottom: 12px;
+    }
+    .card-blue  { border-left: 4px solid #3B82F6; }
+    .card-green { border-left: 4px solid #10B981; }
+    .card-amber { border-left: 4px solid #F59E0B; }
+    .card-red   { border-left: 4px solid #EF4444; }
+    .badge {
+        display: inline-block; padding: 2px 10px; border-radius: 20px;
+        font-size: 11px; font-weight: 600;
+    }
+    .badge-ok  { background: #D1FAE5; color: #065F46; }
+    .badge-warn{ background: #FEF3C7; color: #92400E; }
+    .badge-bad { background: #FEE2E2; color: #991B1B; }
+    #MainMenu, footer, header { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════════════
+# RESEARCH-VALIDATED CONSTANTS
+# ════════════════════════════════════════════════════════════════════
+
+# Optimal weights from Spearman correlation (research validated)
+RESEARCH_WEIGHTS = {
+    'Ratio_vs_Cluster': 0.4719,
+    'Avg_Trx':          0.4140,
+    'Ton_Growth':       0.1141,
+}
+
+# Reward rates per cluster × brand role (Rp/ton) — from company policy
+REWARD_RATES = {
+    'Platinum':       {'Main Brand': 3750, 'Companion Brand': 1875, 'Fighting Brand': 1875},
+    'Super Platinum': {'Main Brand': 3750, 'Companion Brand': 1875, 'Fighting Brand': 1875},
+    'Gold':           {'Main Brand': 2500, 'Companion Brand': 1250, 'Fighting Brand': 1250},
+    'Silver':         {'Main Brand': 2500, 'Companion Brand': 1250, 'Fighting Brand': 1250},
+    'Bronze':         {'Main Brand': 2500, 'Companion Brand': 1250, 'Fighting Brand': 1250},
+}
+
+# Province-level brand mapping — anonymized (Area → Province → roles)
+FIGHTING_BRAND_PROVINCES = [
+    'Kalimantan Timur', 'Kalimantan Utara',
+    'Sulawesi Tengah', 'Sulawesi Selatan',
+]
+
+BRAND_MAP_BY_PROV = {
+    'SP': {
+        'ACEH':            {'main': ['PADANG'], 'companion': ['ANDALAS', 'DYNAMIX']},
+        'RIAU DARATAN':    {'main': ['PADANG'], 'companion': ['DYNAMIX']},
+        'RIAU KEPULAUAN':  {'main': ['PADANG'], 'companion': ['ANDALAS']},
+        'SUMATERA BARAT':  {'main': ['PADANG'], 'companion': []},
+        'SUMATERA UTARA':  {'main': ['PADANG'], 'companion': ['ANDALAS', 'DYNAMIX']},
+        'BENGKULU':        {'main': ['PADANG'], 'companion': ['DYNAMIX']},
+        'JAMBI':           {'main': ['PADANG'], 'companion': []},
+    },
+    'SMBR': {
+        'SUMATERA SELATAN': {'main': ['BATURAJA'], 'companion': ['PADANG', 'DYNAMIX']},
+        'LAMPUNG':           {'main': ['BATURAJA'], 'companion': ['DYNAMIX']},
+    },
+    'ST': {
+        'SULAWESI BARAT':    {'main': ['TONASA'], 'companion': []},
+        'SULAWESI SELATAN':  {'main': ['TONASA'], 'companion': []},
+        'SULAWESI TENGAH':   {'main': ['TONASA'], 'companion': []},
+        'SULAWESI TENGGARA': {'main': ['TONASA'], 'companion': []},
+        'SULAWESI UTARA':    {'main': ['TONASA'], 'companion': []},
+        'GORONTALO':         {'main': ['TONASA'], 'companion': []},
+        'MALUKU':            {'main': ['TONASA'], 'companion': []},
+        'MALUKU UTARA':      {'main': ['TONASA'], 'companion': []},
+        'N.T.T.':            {'main': ['TONASA'], 'companion': []},
+        'N.T.B.':            {'main': ['TONASA'], 'companion': ['GRESIK']},
+        'PAPUA':             {'main': ['TONASA'], 'companion': ['GRESIK']},
+        'PAPUA BARAT':       {'main': ['TONASA'], 'companion': ['GRESIK']},
+        'KALIMANTAN SELATAN':{'main': ['TONASA'], 'companion': ['GRESIK']},
+        'KALIMANTAN TIMUR':  {'main': ['TONASA'], 'companion': ['GRESIK']},
+        'KALIMANTAN UTARA':  {'main': ['TONASA'], 'companion': ['GRESIK']},
+    },
+}
+
+CLUSTER_ORDER  = ['Bronze', 'Silver', 'Gold', 'Platinum', 'Super Platinum']
+CLUSTER_COLORS = {
+    'Bronze':        '#CD7F32',
+    'Silver':        '#94A3B8',
+    'Gold':          '#EAB308',
+    'Platinum':      '#60A5FA',
+    'Super Platinum':'#8B5CF6',
+}
+
+COL_TGL     = 'Tanggal Transaksi'
+COL_ID      = 'ID Toko'
+COL_NAMA    = 'Nama Toko'
+COL_CLUSTER = 'Cluster Pareto'
+COL_PROV    = 'Provinsi Toko'
+COL_AREA_AP = 'Area AP Toko'
+COL_AREA    = 'Area Toko'
+COL_BRAND   = 'Brands'
+COL_TON     = 'TON Quantity'
+
+# ════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ════════════════════════════════════════════════════════════════════
+
+def normalize(s: pd.Series) -> pd.Series:
+    mn, mx = s.min(), s.max()
+    return (s - mn) / (mx - mn + 1e-9)
+
+def get_brand_category(area: str, brand: str, prov: str) -> str:
+    """Province-level brand categorization (research-validated)."""
+    area_map = BRAND_MAP_BY_PROV.get(str(area).strip().upper(), None)
+    if area_map is None:
+        return 'Other'
+
+    prov_upper = str(prov).strip().upper()
+    brand_upper = str(brand).strip().upper()
+
+    # Exact match first, then partial match
+    prov_map = area_map.get(prov_upper)
+    if prov_map is None:
+        for key in area_map:
+            if key in prov_upper or prov_upper in key:
+                prov_map = area_map[key]
+                break
+
+    if prov_map is None:
+        # Fallback to area-level
+        fallback = {
+            'SP':   {'main': ['PADANG'],   'companion': ['DYNAMIX', 'ANDALAS', 'BATURAJA']},
+            'SMBR': {'main': ['BATURAJA'], 'companion': ['DYNAMIX', 'PADANG']},
+            'ST':   {'main': ['TONASA'],   'companion': ['GRESIK']},
+        }
+        prov_map = fallback.get(str(area).strip().upper(), {'main': [], 'companion': []})
+
+    if any(kw in brand_upper for kw in prov_map['main']):
+        return 'Main Brand'
+    if prov_map['companion'] and any(kw in brand_upper for kw in prov_map['companion']):
+        return 'Companion Brand'
+    # Fighting Brand — only ST + specific provinces
+    if str(area).strip().upper() == 'ST' and 'MERDEKA' in brand_upper:
+        if str(prov).strip() in FIGHTING_BRAND_PROVINCES:
+            return 'Fighting Brand'
+    return 'Other'
+
+def get_reward_per_ton(cluster: str, brand_cat: str) -> float:
+    """Research-validated reward rate lookup."""
+    cluster_map = REWARD_RATES.get(cluster, REWARD_RATES['Bronze'])
+    return cluster_map.get(brand_cat, 0.0)
+
+def compute_spearman_weights(agg_df: pd.DataFrame) -> dict:
+    """Data-driven weight determination via Spearman correlation."""
+    vars_score = ['Ratio_vs_Cluster', 'Avg_Trx', 'Ton_Growth']
+    raw_w = {}
+    for v in vars_score:
+        r, _ = spearmanr(agg_df[v], agg_df['Avg_Ton'])
+        raw_w[v] = abs(r)
+    total = sum(raw_w.values())
+    return {k: v / total for k, v in raw_w.items()}
+
+def compute_scores(agg_df: pd.DataFrame, w1: float, w2: float, w3: float) -> pd.DataFrame:
+    """Compute composite scores."""
+    df = agg_df.copy()
+    df['Score'] = (
+        w1 * df['Ratio_vs_Cluster'] +
+        w2 * normalize(df['Avg_Trx']) +
+        w3 * normalize(df['Ton_Growth'])
+    )
+    return df
+
+def jaccard(a, b) -> float:
+    sa, sb = set(a), set(b)
+    return len(sa & sb) / len(sa | sb) if len(sa | sb) > 0 else 0.0
+
+def fmt_rp(val: float) -> str:
+    return f"Rp {val:,.0f}"
+
+@st.cache_data(show_spinner=False)
+def load_parquet(file_bytes: bytes) -> pd.DataFrame:
+    import io
+    df = pd.read_parquet(io.BytesIO(file_bytes))
+    df[COL_ID]  = df[COL_ID].astype(str).str.strip()
+    df[COL_TGL] = pd.to_datetime(df[COL_TGL], errors='coerce')
+    return df.dropna(subset=[COL_TGL])
+
+@st.cache_data(show_spinner=False)
+def read_uploaded_file(file_bytes: bytes, fname: str) -> pd.DataFrame:
+    import io
+    if fname.endswith('.csv'):
+        return pd.read_csv(io.BytesIO(file_bytes), dtype={COL_ID: str})
+    elif fname.endswith(('.xlsx', '.xls')):
+        return pd.read_excel(io.BytesIO(file_bytes), dtype={COL_ID: str})
+    elif fname.endswith('.parquet'):
+        df = pd.read_parquet(io.BytesIO(file_bytes))
+        df[COL_ID] = df[COL_ID].astype(str)
+        return df
+    raise ValueError(f"Format tidak didukung: {fname}")
+
+def build_agg(df_input: pd.DataFrame, min_bulan: int = 3) -> pd.DataFrame:
+    """
+    Aggregate transactions to store level.
+    Research best practices applied:
+    - Survivorship-corrected Ton_Growth anchored to T_max
+    - Brand-mix-weighted Estimated_Cost per cluster
+    - Province-level brand categorization
+    """
+    df = df_input.copy()
+    df['Bulan'] = df[COL_TGL].dt.to_period('M').astype(str)
+
+    # Apply brand categorization
+    df['Brand_Category'] = df.apply(
+        lambda r: get_brand_category(r[COL_AREA_AP], r[COL_BRAND], r[COL_PROV]), axis=1
+    )
+    df['Reward_per_Ton'] = df.apply(
+        lambda r: get_reward_per_ton(r[COL_CLUSTER], r['Brand_Category']), axis=1
+    )
+
+    # Monthly aggregation
+    monthly = (
+        df.groupby([COL_ID, COL_NAMA, COL_CLUSTER, COL_AREA_AP, COL_PROV, COL_AREA, 'Bulan'])
+        .agg(Total_Ton=(COL_TON, 'sum'), Jumlah_Trx=(COL_TGL, 'count'))
+        .reset_index()
+    )
+
+    # Store-level aggregation
+    agg = (
+        monthly.groupby([COL_ID, COL_NAMA, COL_CLUSTER, COL_AREA_AP, COL_PROV, COL_AREA])
+        .agg(
+            Avg_Ton   =('Total_Ton',    'mean'),
+            Avg_Trx   =('Jumlah_Trx',  'mean'),
+            Total_Bulan=('Bulan',       'nunique'),
+        )
+        .reset_index()
+    )
+
+    # ── Survivorship-corrected Ton_Growth (RESEARCH FIX) ──────────
+    # Anchor last_val to T_max — stores inactive in final month get 0
+    target_last = monthly['Bulan'].max()
+    growths = []
+    for sid in agg[COL_ID]:
+        td = monthly[monthly[COL_ID] == sid]
+        last_series = td[td['Bulan'] == target_last]['Total_Ton']
+        last_val    = last_series.values[0] if len(last_series) > 0 else 0.0
+        prev_data   = td[td['Bulan'] < target_last]['Total_Ton']
+        prev_mean   = prev_data.mean() if len(prev_data) > 0 else 0.0
+        growths.append((last_val - prev_mean) / prev_mean if prev_mean > 0 else 0.0)
+    agg['Ton_Growth'] = growths
+
+    # Ratio vs Cluster
+    cluster_avg = agg.groupby(COL_CLUSTER)['Avg_Ton'].mean().to_dict()
+    agg['Ratio_vs_Cluster'] = agg.apply(
+        lambda r: r['Avg_Ton'] / cluster_avg.get(r[COL_CLUSTER], 1.0), axis=1
+    )
+
+    # ── Brand-mix-weighted Estimated_Cost (RESEARCH FIX) ──────────
+    # C_i = SUM_b (Avg_Ton_{i,b} * R_b^(k_i))
+    df_valid = df[df['Brand_Category'] != 'Other'].copy()
+    ton_brand = (
+        df_valid.groupby([COL_ID, 'Brand_Category', 'Reward_per_Ton'])[COL_TON]
+        .sum().reset_index()
+    )
+    ton_brand = ton_brand.merge(agg[[COL_ID, 'Total_Bulan']], on=COL_ID, how='left')
+    ton_brand['Avg_Ton_Brand'] = ton_brand[COL_TON] / ton_brand['Total_Bulan']
+    ton_brand['Cost_Brand']    = ton_brand['Avg_Ton_Brand'] * ton_brand['Reward_per_Ton']
+    cost_per_store = (
+        ton_brand.groupby(COL_ID)['Cost_Brand']
+        .sum().reset_index()
+        .rename(columns={'Cost_Brand': 'Estimated_Cost'})
+    )
+    agg = agg.merge(cost_per_store, on=COL_ID, how='left')
+    agg['Estimated_Cost'] = agg['Estimated_Cost'].fillna(0)
+
+    # Dormancy Risk proxy
+    max_bulan = monthly['Bulan'].nunique()
+    agg['Dormancy_Risk'] = 1 - (agg['Total_Bulan'] / max(max_bulan, 1))
+
+    # Filter min active months
+    agg = agg[agg['Total_Bulan'] >= min_bulan].copy().reset_index(drop=True)
+    return agg, monthly
+
+def run_ilp(agg_scored: pd.DataFrame, n_max: int, budget: float,
+            cluster_pcts: dict = None, relax: float = 1.0) -> list:
+    """
+    ILP solver — math.ceil on cluster caps (RESEARCH FIX).
+    """
+    df = agg_scored.drop_duplicates(subset=[COL_ID]).copy()
+    prob   = pulp.LpProblem("Loyalty", pulp.LpMaximize)
+    x_vars = {
+        row[COL_ID]: pulp.LpVariable(f"x_{i}", cat='Binary')
+        for i, row in df.iterrows()
+    }
+
+    # Objective
+    prob += pulp.lpSum(row['Score'] * x_vars[row[COL_ID]] for _, row in df.iterrows())
+
+    # C1: count quota
+    prob += pulp.lpSum(x_vars.values()) <= int(n_max)
+
+    # C2: budget
+    if budget > 0:
+        prob += pulp.lpSum(
+            row['Estimated_Cost'] * x_vars[row[COL_ID]] for _, row in df.iterrows()
+        ) <= budget
+
+    # C3: cluster cap — math.ceil (RESEARCH FIX, not floor)
+    if cluster_pcts:
+        for cl, pct in cluster_pcts.items():
+            members = df[df[COL_CLUSTER] == cl][COL_ID].tolist()
+            cap = int(math.ceil((pct * relax / 100.0) * n_max))
+            if members and cap > 0:
+                prob += pulp.lpSum(x_vars[s] for s in members if s in x_vars) <= cap
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    return [s for s, v in x_vars.items() if pulp.value(v) == 1]
+
+def to_excel_multi(sheets: dict) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        for name, df in sheets.items():
+            df.to_excel(w, sheet_name=name[:31], index=False)
+        pd.DataFrame({
+            'Info':  ['Export Date', 'Tool', 'Version'],
+            'Value': [datetime.now().strftime('%Y-%m-%d %H:%M'), 'Loyalty Optimizer', '2.0']
+        }).to_excel(w, sheet_name='Metadata', index=False)
+    return buf.getvalue()
+
+# ════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("## 🎯 Loyalty Optimizer")
+    st.markdown('<div style="color:#9EAFC2;font-size:12px;margin-bottom:16px;">v2.0 · Research Edition</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-hdr" style="color:#9EAFC2;">📂 Upload Data</div>', unsafe_allow_html=True)
+    uploaded_file   = st.file_uploader("File Transaksi", type=['csv','xlsx','xls','parquet'])
+    existing_file   = st.file_uploader("List Toko Existing (CSV)", type=['csv'],
+                                        help="1 kolom ID Toko yang saat ini aktif di loyalty program")
+
+    st.markdown('<div class="section-hdr" style="color:#9EAFC2;">📍 Filter Geografis</div>', unsafe_allow_html=True)
+    filter_area_ap  = st.multiselect("Area AP Toko", [], key='f_area_ap')
+    filter_prov     = st.multiselect("Provinsi Toko", [], key='f_prov')
+    filter_area     = st.multiselect("Area Toko", [], key='f_area')
+
+    st.markdown('<div class="section-hdr" style="color:#9EAFC2;">🏅 Filter Performa</div>', unsafe_allow_html=True)
+    filter_cluster  = st.multiselect("Cluster Pareto", CLUSTER_ORDER, key='f_cluster')
+    min_bulan       = st.number_input("Min. Bulan Aktif", 1, 24, 3)
+    min_avg_ton     = st.number_input("Min. Avg Ton/Bulan", 0.0, step=1.0, value=0.0)
+
+    st.markdown('<div class="section-hdr" style="color:#9EAFC2;">❌ Exclude Toko</div>', unsafe_allow_html=True)
+    excluded_str    = st.text_area("ID Toko (satu/baris)", height=80)
+
+    st.markdown('<div class="section-hdr" style="color:#9EAFC2;">⚖️ Metode Pembobotan</div>', unsafe_allow_html=True)
+    weight_mode     = st.radio("Metode", ['Spearman (Recommended)', 'Manual'], index=0)
+    if weight_mode == 'Manual':
+        wr = st.slider("w₁ Ratio_vs_Cluster (%)", 0, 100, 47)
+        wt = st.slider("w₂ Avg_Trx (%)",           0, 100, 41)
+        wg = st.slider("w₃ Ton_Growth (%)",         0, 100, 12)
+        wsum = wr + wt + wg
+        manual_w = {
+            'Ratio_vs_Cluster': wr / max(wsum, 1),
+            'Avg_Trx':          wt / max(wsum, 1),
+            'Ton_Growth':       wg / max(wsum, 1),
+        }
+
+    st.markdown('<div class="section-hdr" style="color:#9EAFC2;">🎯 ILP Settings</div>', unsafe_allow_html=True)
+    n_max_mode      = st.radio("Kuota (N_max)", ['= Jumlah Existing', 'Manual'], index=0)
+    n_max_manual    = st.number_input("N_max Manual", 1, 10000, 1000,
+                                       disabled=(n_max_mode=='= Jumlah Existing'))
+    budget_mode     = st.radio("Budget", ['= Biaya Existing (Self-Calibrating)', 'Manual'], index=0)
+    budget_manual   = st.number_input("Budget Manual (Rp)", 0, value=1_000_000_000,
+                                       disabled=(budget_mode=='= Biaya Existing (Self-Calibrating)'))
+
+    st.markdown("**Cluster Constraint (λ)**")
+    ilp_scenario    = st.select_slider(
+        "Skenario ILP",
+        options=['A: Mirror (λ=1.0)', 'B: Relaxed (λ=1.5)', 'C: Unconstrained'],
+        value='A: Mirror (λ=1.0)',
+        help="Penelitian: Robustness boundary di λ=1.20x. ILP-A (Mirror) direkomendasikan."
+    )
+    lambda_val = 1.0 if 'Mirror' in ilp_scenario else (1.5 if 'Relaxed' in ilp_scenario else 999)
+    apply_cluster_cap = lambda_val < 999
+
+    st.markdown("---")
+    run_btn = st.button("▶  Jalankan Optimasi", type="primary", use_container_width=True,
+                         disabled=(uploaded_file is None))
+
+# ════════════════════════════════════════════════════════════════════
+# MAIN HEADER
+# ════════════════════════════════════════════════════════════════════
+st.markdown('<div style="font-size:26px;font-weight:700;color:#1E293B;margin-bottom:4px;">🎯 Loyalty Store Selection Optimizer</div>', unsafe_allow_html=True)
+st.markdown('<div style="font-size:14px;color:#64748B;margin-bottom:24px;">Data-Driven Portfolio Optimization · MCS + Integer Linear Programming · Research Edition</div>', unsafe_allow_html=True)
+
+if uploaded_file is None:
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("""
+        <div class="card card-blue">
+            <div class="section-hdr">Cara Penggunaan</div>
+            <p style="color:#475569;font-size:14px;line-height:1.7;">
+            <b>1.</b> Upload file transaksi di sidebar<br>
+            <b>2.</b> Upload list toko existing loyalty (CSV, 1 kolom ID)<br>
+            <b>3.</b> Atur filter dan parameter<br>
+            <b>4.</b> Klik Jalankan Optimasi
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_b:
+        st.markdown("""
+        <div class="card card-green">
+            <div class="section-hdr">Struktur Reward (per Ton)</div>
+            <table style="width:100%;font-size:13px;border-collapse:collapse;">
+            <tr style="color:#374151;font-weight:600;border-bottom:1px solid #E2E8F0;">
+                <td style="padding:6px 0;">Cluster</td><td>Main Brand</td><td>CB / FB</td>
+            </tr>
+            <tr><td style="padding:4px 0;color:#6B7280;">Platinum & Super Plat.</td>
+                <td style="color:#059669;font-weight:600;">Rp 3,750</td><td>Rp 1,875</td></tr>
+            <tr><td style="color:#6B7280;">Gold / Silver / Bronze</td>
+                <td style="color:#059669;font-weight:600;">Rp 2,500</td><td>Rp 1,250</td></tr>
+            </table>
+        </div>
+        """, unsafe_allow_html=True)
+    st.stop()
+
+# ════════════════════════════════════════════════════════════════════
+# LOAD & PROCESS DATA
+# ════════════════════════════════════════════════════════════════════
+with st.spinner("Memuat data..."):
+    df_raw = read_uploaded_file(uploaded_file.getvalue(), uploaded_file.name.lower())
+    df_raw[COL_ID] = df_raw[COL_ID].astype(str).str.strip()
+    df_raw[COL_TGL] = pd.to_datetime(df_raw[COL_TGL], errors='coerce')
+    df_raw = df_raw.dropna(subset=[COL_TGL])
+
+# Update sidebar filters dynamically
+all_areas_ap = sorted(df_raw[COL_AREA_AP].dropna().unique())
+all_provs    = sorted(df_raw[COL_PROV].dropna().unique())
+all_areas    = sorted(df_raw[COL_AREA].dropna().unique())
+
+# Load existing loyalty list
+existing_ids = set()
+if existing_file:
+    ex_df = pd.read_csv(existing_file, dtype=str)
+    ex_df.columns = [COL_ID]
+    existing_ids = set(ex_df[COL_ID].str.strip().unique())
+
+# ── Apply geographic filters ──────────────────────────────────────
+df = df_raw.copy()
+if filter_area_ap: df = df[df[COL_AREA_AP].isin(filter_area_ap)]
+if filter_prov:    df = df[df[COL_PROV].isin(filter_prov)]
+if filter_area:    df = df[df[COL_AREA].isin(filter_area)]
+if filter_cluster: df = df[df[COL_CLUSTER].isin(filter_cluster)]
+
+if df.empty:
+    st.warning("Tidak ada data setelah filter. Sesuaikan filter di sidebar.")
+    st.stop()
+
+# ── Build aggregation ─────────────────────────────────────────────
+with st.spinner("Menghitung agregasi dan skor..."):
+    agg, monthly = build_agg(df, min_bulan)
+
+if min_avg_ton > 0:
+    agg = agg[agg['Avg_Ton'] >= min_avg_ton].copy()
+
+# Exclude IDs
+if excluded_str:
+    excluded = [x.strip() for x in excluded_str.splitlines() if x.strip()]
+    agg = agg[~agg[COL_ID].isin(excluded)].copy()
+
+# ── Weights ───────────────────────────────────────────────────────
+if weight_mode == 'Spearman (Recommended)':
+    weights = compute_spearman_weights(agg)
+else:
+    weights = manual_w
+
+W1 = weights['Ratio_vs_Cluster']
+W2 = weights['Avg_Trx']
+W3 = weights['Ton_Growth']
+
+# ── Score ─────────────────────────────────────────────────────────
+agg = compute_scores(agg, W1, W2, W3)
+
+# ── N_max & Budget ────────────────────────────────────────────────
+existing_in_pool = agg[agg[COL_ID].isin(existing_ids)]
+N_MAX = len(existing_ids & set(agg[COL_ID])) if n_max_mode == '= Jumlah Existing' else n_max_manual
+N_MAX = max(N_MAX, 1)
+
+BUDGET = existing_in_pool['Estimated_Cost'].sum() \
+    if budget_mode == '= Biaya Existing (Self-Calibrating)' else budget_manual
+
+# ── Cluster proportions from existing ────────────────────────────
+cluster_pcts = None
+if apply_cluster_cap and len(existing_in_pool) > 0:
+    cluster_pcts = (
+        existing_in_pool[COL_CLUSTER]
+        .value_counts(normalize=True).mul(100).round(2).to_dict()
+    )
+
+# ════════════════════════════════════════════════════════════════════
+# OVERVIEW METRICS
+# ════════════════════════════════════════════════════════════════════
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Toko Kandidat", f"{len(agg):,}")
+c2.metric("Existing Loyalty", f"{len(existing_ids):,}")
+c3.metric("N_max", f"{N_MAX:,}")
+c4.metric("Budget Ceiling", fmt_rp(BUDGET) if BUDGET > 0 else "Tidak terbatas")
+c5.metric("Bobot Terpilih", weight_mode.split()[0])
 
 st.markdown("---")
 
+# ════════════════════════════════════════════════════════════════════
+# TABS
+# ════════════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Dataset & Skor",
+    "⚖️ Analisis Bobot",
+    "🚀 Optimasi & Benchmark",
+    "📅 Tren Bulanan",
+    "🔬 Sensitivitas",
+    "📋 Export",
+])
 
+# ════════════════════════════════════════════════════════════════════
+# TAB 1: DATASET & SCORE OVERVIEW
+# ════════════════════════════════════════════════════════════════════
+with tab1:
+    st.markdown('<div class="section-hdr">Statistik Deskriptif per Cluster</div>', unsafe_allow_html=True)
 
-# ============================================================
+    desc = (agg.groupby(COL_CLUSTER)
+            .agg(N_Toko=(COL_ID,'count'), Avg_Ton_Mean=('Avg_Ton','mean'),
+                 Avg_Ton_Med=('Avg_Ton','median'), Avg_Trx_Mean=('Avg_Trx','mean'),
+                 Growth_Mean=('Ton_Growth','mean'), Cost_Mean=('Estimated_Cost','mean'))
+            .reset_index())
+    desc[COL_CLUSTER] = pd.Categorical(desc[COL_CLUSTER], CLUSTER_ORDER, ordered=True)
+    desc = desc.sort_values(COL_CLUSTER)
 
-# LANGKAH 2: FILTER & OPTIMASI (Sidebar + Main)
+    st.dataframe(desc.style.format({
+        'N_Toko': '{:,}', 'Avg_Ton_Mean': '{:.2f}', 'Avg_Ton_Med': '{:.2f}',
+        'Avg_Trx_Mean': '{:.2f}', 'Growth_Mean': '{:.3f}', 'Cost_Mean': '{:,.0f}',
+    }).background_gradient(subset=['Avg_Ton_Mean'], cmap='Blues'),
+    use_container_width=True, hide_index=True)
 
-# ============================================================
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fig = px.bar(desc, x=COL_CLUSTER, y='N_Toko',
+                     color=COL_CLUSTER, color_discrete_map=CLUSTER_COLORS,
+                     title='Jumlah Toko per Cluster', template='plotly_white')
+        fig.update_layout(showlegend=False, height=300)
+        st.plotly_chart(fig, use_container_width=True)
+    with col_b:
+        fig2 = px.bar(desc, x=COL_CLUSTER, y='Avg_Ton_Mean',
+                      color=COL_CLUSTER, color_discrete_map=CLUSTER_COLORS,
+                      title='Avg Tonase/Bulan per Cluster', template='plotly_white')
+        fig2.update_layout(showlegend=False, height=300)
+        st.plotly_chart(fig2, use_container_width=True)
 
-if 'agg' in st.session_state:
+    st.markdown('<div class="section-hdr">Distribusi Variabel Scoring</div>', unsafe_allow_html=True)
+    fig3 = make_subplots(rows=1, cols=3,
+                          subplot_titles=['Ratio_vs_Cluster', 'Avg_Trx', 'Ton_Growth'])
+    colors3 = ['#3B82F6', '#10B981', '#F59E0B']
+    for i, (v, c) in enumerate(zip(['Ratio_vs_Cluster','Avg_Trx','Ton_Growth'], colors3), 1):
+        skew = agg[v].skew()
+        fig3.add_trace(go.Histogram(x=agg[v], nbinsx=40, marker_color=c,
+                                     name=v, showlegend=False), row=1, col=i)
+        fig3.add_annotation(
+            x=0.5, y=1.05, xref=f'x{i} domain', yref=f'y{i} domain',
+            text=f"skewness = {skew:+.2f}", showarrow=False,
+            font=dict(size=10, color='#6B7280')
+        )
+    fig3.update_layout(template='plotly_white', height=280,
+                        title_text='Distribusi Variabel (skewness > 1 → Spearman lebih tepat dari Pearson)')
+    st.plotly_chart(fig3, use_container_width=True)
 
-    base_agg = st.session_state.agg
+# ════════════════════════════════════════════════════════════════════
+# TAB 2: WEIGHT ANALYSIS
+# ════════════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown('<div class="section-hdr">Perbandingan Metode Pembobotan Objektif</div>', unsafe_allow_html=True)
 
+    # Compute all three methods
+    from scipy.stats import pearsonr
+    vars_score = ['Ratio_vs_Cluster', 'Avg_Trx', 'Ton_Growth']
+    rows_w = []
+    for v in vars_score:
+        rp, _ = pearsonr(agg[v], agg['Avg_Ton'])
+        rs, _ = spearmanr(agg[v], agg['Avg_Ton'])
+        rows_w.append({
+            'Variabel': v, 'Skewness': round(agg[v].skew(), 3),
+            'Pearson_r': abs(rp), 'Spearman_r': abs(rs),
+        })
+    w_df = pd.DataFrame(rows_w)
+    for method, col_r in [('Pearson', 'Pearson_r'), ('Spearman', 'Spearman_r')]:
+        total = w_df[col_r].sum()
+        w_df[f'{method}_w'] = w_df[col_r] / total
 
+    # EWM
+    data_norm = agg[vars_score].copy().reset_index(drop=True)
+    data_norm = data_norm.apply(lambda x: (x - x.min()) / (x.max() - x.min() + 1e-9))
+    prop = data_norm.apply(lambda x: x / (x.sum() + 1e-9))
+    entropy = -(prop * np.log(prop + 1e-9)).sum(axis=0) / np.log(len(data_norm) + 1e-9)
+    d = 1 - entropy
+    ewm_w = (d / d.sum()).to_dict()
+    w_df['EWM_w'] = w_df['Variabel'].map(ewm_w)
+    w_df['Final_w'] = w_df['Variabel'].map(weights)
 
-    # ---- Sidebar: semua kontrol parameter ----
+    st.dataframe(w_df.style.format({
+        'Skewness': '{:+.3f}', 'Pearson_r': '{:.4f}', 'Spearman_r': '{:.4f}',
+        'Pearson_w': '{:.4f}', 'Spearman_w': '{:.4f}', 'EWM_w': '{:.4f}', 'Final_w': '{:.4f}'
+    }).highlight_max(subset=['Final_w'], color='#DBEAFE'),
+    use_container_width=True, hide_index=True)
 
-    with st.sidebar:
+    col_w1, col_w2 = st.columns([3, 2])
+    with col_w1:
+        # Grouped bar chart comparison
+        melt = []
+        for _, r in w_df.iterrows():
+            for m, col in [('Pearson', 'Pearson_w'), ('Spearman', 'Spearman_w'),
+                           ('EWM', 'EWM_w'), ('Final', 'Final_w')]:
+                melt.append({'Variabel': r['Variabel'], 'Metode': m, 'Bobot': r[col]})
+        melt_df = pd.DataFrame(melt)
+        fig_w = px.bar(melt_df, x='Variabel', y='Bobot', color='Metode',
+                       barmode='group', template='plotly_white',
+                       title='Perbandingan Bobot — 3 Metode + Final',
+                       color_discrete_sequence=['#3B82F6','#10B981','#F59E0B','#EF4444'])
+        fig_w.update_layout(height=320)
+        st.plotly_chart(fig_w, use_container_width=True)
+    with col_w2:
+        st.markdown(f"""
+        <div class="card card-green">
+            <div class="section-hdr">Bobot Final Terkunci</div>
+            <div style="font-family:monospace;font-size:14px;line-height:2;">
+                w₁ Ratio = {W1:.4f}<br>
+                w₂ Trx   = {W2:.4f}<br>
+                w₃ Growth = {W3:.4f}
+            </div>
+            <div style="font-size:12px;color:#6B7280;margin-top:8px;">
+                Metode: {weight_mode.split()[0]}<br>
+                Penelitian: Spearman terbukti superior via walk-forward validation.
+                Spearman cocok karena skewness semua variabel >6.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        st.markdown("## 🛠️ Panel Kontrol")
+# ════════════════════════════════════════════════════════════════════
+# TAB 3: OPTIMIZATION & BENCHMARK
+# ════════════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown('<div class="section-hdr">Optimasi ILP & Benchmark 6 Metode</div>', unsafe_allow_html=True)
+
+    if not run_btn and 'opt_results' not in st.session_state:
+        st.info("👆 Klik **▶ Jalankan Optimasi** di sidebar untuk menjalankan semua 6 metode.")
+    else:
+        if run_btn:
+            results = {}
+            with st.spinner("Menjalankan 6 metode seleksi..."):
+
+                # ── 1. Manual ──────────────────────────────────────
+                manual_ids = list(existing_ids & set(agg[COL_ID]))
+
+                # ── 2. Top-N Tonnage ───────────────────────────────
+                topn_ids = agg.sort_values('Avg_Ton', ascending=False).head(N_MAX)[COL_ID].tolist()
+
+                # ── 3. Greedy ──────────────────────────────────────
+                greedy_ids = agg.sort_values('Score', ascending=False).head(N_MAX)[COL_ID].tolist()
+
+                # ── 4. ILP-A Mirror ────────────────────────────────
+                ilpa_ids = run_ilp(agg, N_MAX, BUDGET, cluster_pcts, relax=1.0)
+
+                # ── 5. ILP-B Relaxed ───────────────────────────────
+                ilpb_ids = run_ilp(agg, N_MAX, BUDGET, cluster_pcts, relax=1.5)
+
+                # ── 6. ILP-C Unconstrained ─────────────────────────
+                ilpc_ids = run_ilp(agg, N_MAX, BUDGET, None, relax=1.0)
+
+            # ── Evaluate each method ─────────────────────────────
+            def eval_method(ids, label):
+                sel = agg[agg[COL_ID].isin(ids)]
+                man = agg[agg[COL_ID].isin(manual_ids)]
+                man_ton = man['Avg_Ton'].sum()
+                total_cost = sel['Estimated_Cost'].sum()
+                total_score = sel['Score'].sum()
+                hidden = agg[agg[COL_ID].isin(set(ids) - set(manual_ids))]['Avg_Ton'].sum()
+                feasible = (total_cost <= BUDGET * 1.03) if BUDGET > 0 else True
+                return {
+                    'Metode': label,
+                    'N_Toko': len(ids),
+                    'Total_Score': round(total_score, 2),
+                    'Avg_Score': round(sel['Score'].mean(), 4),
+                    'Est_Cost': round(total_cost, 0),
+                    'Budget_Util_pct': round(total_cost / BUDGET * 100 if BUDGET > 0 else 0, 2),
+                    'Total_Est_Ton': round(sel['Avg_Ton'].sum(), 2),
+                    'Delta_Ton_vs_Manual_pct': round(
+                        (sel['Avg_Ton'].sum() - man_ton) / man_ton * 100 if man_ton > 0 else 0, 2),
+                    'Ton_Tersembunyi': round(hidden, 2),
+                    'Overlap_Manual_pct': round(
+                        len(set(ids) & set(manual_ids)) / len(manual_ids) * 100 if manual_ids else 0, 2),
+                    'Feasible': '✅ Ya' if feasible else '❌ Infeasible',
+                    **{f'Cl_{k}': round(
+                        sel[COL_CLUSTER].value_counts(normalize=True).get(k, 0) * 100, 1)
+                       for k in CLUSTER_ORDER},
+                }
+
+            bench = pd.DataFrame([
+                eval_method(manual_ids, 'Manual (Existing)'),
+                eval_method(topn_ids,   'Top-N Tonnage'),
+                eval_method(greedy_ids, 'Greedy'),
+                eval_method(ilpa_ids,   'ILP-A Mirror ★'),
+                eval_method(ilpb_ids,   'ILP-B Relaxed 1.5×'),
+                eval_method(ilpc_ids,   'ILP-C Unconstrained'),
+            ])
+
+            selected_final = agg[agg[COL_ID].isin(ilpa_ids)].copy()
+            selected_final['Is_New'] = ~selected_final[COL_ID].isin(existing_ids)
+
+            st.session_state['opt_results']     = bench
+            st.session_state['ilpa_ids']        = ilpa_ids
+            st.session_state['manual_ids']      = manual_ids
+            st.session_state['selected_final']  = selected_final
+            st.session_state['monthly']         = monthly
+
+        bench = st.session_state['opt_results']
+        ilpa_ids = st.session_state['ilpa_ids']
+        selected_final = st.session_state['selected_final']
+
+        # ── Summary cards (ILP-A) ────────────────────────────────
+        ilpa_row = bench[bench['Metode']=='ILP-A Mirror ★'].iloc[0]
+        man_row  = bench[bench['Metode']=='Manual (Existing)'].iloc[0]
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("ILP-A Toko Dipilih", f"{ilpa_row['N_Toko']:,}",
+                    f"dari N_max {N_MAX:,}")
+        cc2.metric("Total Score ILP-A", f"{ilpa_row['Total_Score']:,.2f}",
+                    f"+{ilpa_row['Total_Score']-man_row['Total_Score']:,.2f} vs Manual")
+        cc3.metric("Budget Utilization", f"{ilpa_row['Budget_Util_pct']:.1f}%")
+        cc4.metric("Δ Ton vs Manual", f"+{ilpa_row['Delta_Ton_vs_Manual_pct']:.2f}%")
 
         st.markdown("---")
 
-
-
-        st.markdown("### 📍 Filter Geografis")
-
-        available_areas_ap = sorted(base_agg['Area AP Toko'].unique())
-
-        selected_areas_ap = st.multiselect("Area AP Toko (Wajib)", available_areas_ap, default=available_areas_ap)
-
-        if not selected_areas_ap:
-
-            st.warning("Pilih minimal satu Area AP Toko.")
-
-            st.stop()
-
-        agg_filtered_ap = base_agg[base_agg['Area AP Toko'].isin(selected_areas_ap)].copy()
-
-
-
-        available_provinsi = sorted(agg_filtered_ap['Provinsi Toko'].unique())
-
-        selected_provinsi = st.multiselect("Provinsi Toko (opsional)", available_provinsi, default=[])
-
-        agg_filtered_prov = agg_filtered_ap[agg_filtered_ap['Provinsi Toko'].isin(selected_provinsi)].copy() if selected_provinsi else agg_filtered_ap.copy()
-
-
-
-        available_area_toko = sorted(agg_filtered_prov['Area Toko'].unique())
-
-        selected_area_toko = st.multiselect("Area Toko (opsional)", available_area_toko, default=[])
-
-        agg = agg_filtered_prov[agg_filtered_prov['Area Toko'].isin(selected_area_toko)].copy() if selected_area_toko else agg_filtered_prov.copy()
-
-
-
-        st.markdown("---")
-
-        st.markdown("### 🏅 Filter Cluster & Performa")
-
-        all_clusters = sorted(agg['Cluster Pareto'].unique())
-
-        selected_clusters = st.multiselect("Cluster Pareto (opsional)", all_clusters, default=[])
-
-        if selected_clusters:
-
-            agg = agg[agg['Cluster Pareto'].isin(selected_clusters)].copy()
-
-
-
-        min_avg_ton = st.number_input("Min. Rata-rata Tonase / Bulan", min_value=0.0, value=0.0, step=0.5,
-
-                                       help="Hanya tampilkan toko dengan Avg_Ton >= nilai ini")
-
-        if min_avg_ton > 0:
-
-            agg = agg[agg['Avg_Ton'] >= min_avg_ton].copy()
-
-
-
-        min_bulan_aktif = st.number_input("Min. Bulan Aktif Transaksi", min_value=1, value=1, step=1,
-
-                                           help="Toko dengan rekam jejak minimal N bulan")
-
-        if min_bulan_aktif > 1 and 'Total_Bulan_Aktif' in agg.columns:
-
-            agg = agg[agg['Total_Bulan_Aktif'] >= min_bulan_aktif].copy()
-
-
-
-        st.markdown("---")
-
-        st.markdown("### ❌ Kecualikan ID Toko")
-
-        excluded_ids_str = st.text_area("ID Toko (satu per baris)", placeholder="Tempel ID dari Excel...", height=100)
-
-        if excluded_ids_str:
-
-            excluded_ids_list = [x.strip() for x in excluded_ids_str.splitlines() if x.strip()]
-
-            agg['ID Toko'] = agg['ID Toko'].astype(str)
-
-            agg = agg[~agg['ID Toko'].isin(excluded_ids_list)]
-
-
-
-        st.markdown("---")
-
-        st.markdown("### 💰 Anggaran & Kuota")
-
-        max_budget = st.number_input("Anggaran Maks (Rp)", 0, value=1_000_000_000, step=50_000_000)
-
-        total_available = agg.shape[0]
-
-        N_max = st.number_input("Jumlah Toko Maks (N_max)", 1, max(1, total_available),
-
-                                  value=min(500, total_available), step=1)
-
-
-
-        st.markdown("---")
-
-        st.markdown("### ⚖️ Bobot Skor")
-
-        w_ratio = st.slider("Ratio_vs_Cluster (%)", 0, 100, 50)
-
-        w_trx   = st.slider("Avg_Trx (%)", 0, 100, 30)
-
-        w_growth = st.slider("Ton_Growth (%)", 0, 100, 20)
-
-        total_w = w_ratio + w_trx + w_growth
-
-        if total_w == 0:
-
-            w1, w2, w3 = 0.5, 0.3, 0.2
-
-        else:
-
-            w1, w2, w3 = w_ratio/total_w, w_trx/total_w, w_growth/total_w
-
-
-
-        st.markdown("---")
-
-        st.markdown("### 🎯 Batas Maks per Cluster Pareto")
-
-        clusters_list = sorted(agg['Cluster Pareto'].unique())
-
-        cluster_pct_inputs = {}
-
-        for c in clusters_list:
-
-            v = st.number_input(f"Maks {c} (%)", 0.0, 100.0, value=0.0, key=f"clpct_{c}")
-
-            cluster_pct_inputs[c] = v
-
-
-
-        st.markdown("---")
-
-        run_optimize = st.button("▶️ Jalankan Optimasi", type="primary", use_container_width=True)
-
-
-
-    # ---- Main: status data ----
-
-    st.markdown(f'<div class="info-box">🗂️ <b>{agg.shape[0]:,} toko</b> siap dioptimasi berdasarkan filter aktif.</div>', unsafe_allow_html=True)
-
-    st.markdown("")
-
-
-
-    # ============================================================
-
-    # FITUR BARU: SIMULASI WHAT-IF (preview sebelum optimasi)
-
-    # ============================================================
-
-    with st.expander("🔮 Simulasi What-If: Preview Distribusi Skor", expanded=False):
-
-        st.markdown("Lihat bagaimana perubahan bobot memengaruhi distribusi skor **sebelum** menjalankan optimasi penuh.")
-
-        wif1, wif2, wif3 = st.columns(3)
-
-        with wif1:
-
-            wi_ratio = st.slider("Ratio_vs_Cluster (%)", 0, 100, int(w_ratio*100/max(total_w,1)), key="wi_ratio")
-
-        with wif2:
-
-            wi_trx = st.slider("Avg_Trx (%)", 0, 100, int(w_trx*100/max(total_w,1)), key="wi_trx")
-
-        with wif3:
-
-            wi_growth = st.slider("Ton_Growth (%)", 0, 100, int(w_growth*100/max(total_w,1)), key="wi_growth")
-
-
-
-        wi_total = wi_ratio + wi_trx + wi_growth
-
-        if wi_total > 0 and not agg.empty:
-
-            wi_w1, wi_w2, wi_w3 = wi_ratio/wi_total, wi_trx/wi_total, wi_growth/wi_total
-
-            preview_df = compute_scores(agg, wi_w1, wi_w2, wi_w3)
-
-            pc1, pc2, pc3 = st.columns(3)
-
-            pc1.metric("Skor Tertinggi", f"{preview_df['Score'].max():.4f}")
-
-            pc2.metric("Skor Rata-rata", f"{preview_df['Score'].mean():.4f}")
-
-            pc3.metric("Skor Terendah", f"{preview_df['Score'].min():.4f}")
-
-
-
-            hist_chart = alt.Chart(preview_df).mark_bar(color='#2196F3', opacity=0.8).encode(
-
-                x=alt.X('Score:Q', bin=alt.Bin(maxbins=30), title='Distribusi Skor'),
-
-                y=alt.Y('count()', title='Jumlah Toko'),
-
-                color=alt.Color('Cluster Pareto:N'),
-
-                tooltip=['Cluster Pareto', 'count()']
-
-            ).properties(height=250)
-
-            st.altair_chart(hist_chart, use_container_width=True)
-
-
-
-    st.markdown("---")
-
-
-
-    # ============================================================
-
-    # JALANKAN OPTIMASI
-
-    # ============================================================
-
-    if run_optimize:
-
-        agg_final = agg.copy()
-
-        agg_final = compute_scores(agg_final, w1, w2, w3)
-
-
-
-        poin_to_rupiah = {'BRONZE': 5000, 'SILVER': 5000, 'GOLD': 5000, 'PLATINUM': 6250, 'SUPER PLATINUM': 6250}
-
-        agg_final['Rupiah_per_Poin'] = agg_final['Cluster Pareto'].str.upper().map(poin_to_rupiah).fillna(0)
-
-        agg_final['Estimated_Cost'] = agg_final['Avg_Ton'] * agg_final['Rupiah_per_Poin']
-
-        agg_final.sort_values('Score', ascending=False, inplace=True)
-
-        agg_final.drop_duplicates(subset=['ID Toko'], keep='first', inplace=True, ignore_index=True)
-
-
-
-        st.session_state.total_eligible_stores = len(agg_final)
-
-        st.session_state.total_eligible_clusters = agg_final['Cluster Pareto'].nunique()
-
-        st.session_state.n_max_value_for_run = N_max
-
-        st.session_state.max_budget_value_for_run = max_budget
-
-
-
-        try:
-
-            import pulp
-
-        except ImportError:
-
-            st.error("Library 'pulp' tidak ditemukan. Jalankan: pip install pulp")
-
-            st.stop()
-
-
-
-        with st.spinner("Menjalankan optimasi Integer Linear Programming..."):
-
-            prob = pulp.LpProblem("Loyalty_Selection", pulp.LpMaximize)
-
-            x_vars = {row['ID Toko']: pulp.LpVariable(f"x_{row['ID Toko']}", cat='Binary') for _, row in agg_final.iterrows()}
-
-            prob += pulp.lpSum([row['Score'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()])
-
-            prob += pulp.lpSum(x_vars.values()) <= int(N_max)
-
-            prob += pulp.lpSum([row['Estimated_Cost'] * x_vars[row['ID Toko']] for _, row in agg_final.iterrows()]) <= max_budget
-
-
-
-            for cluster_name, max_pct in cluster_pct_inputs.items():
-
-                if max_pct > 0:
-
-                    members = agg_final[agg_final['Cluster Pareto'] == cluster_name]['ID Toko'].tolist()
-
-                    cap = int(math.floor((max_pct / 100.0) * float(N_max)))
-
-                    if members:
-
-                        prob += pulp.lpSum([x_vars[sid] for sid in members]) <= cap
-
-
-
-            prob.solve(pulp.PULP_CBC_CMD(msg=False))
-
-            selected_ids = [str(sid) for sid, var in x_vars.items() if pulp.value(var) == 1]
-
-            agg_final['ID Toko'] = agg_final['ID Toko'].astype(str)
-
-            st.session_state.selected_df = agg_final[agg_final['ID Toko'].isin(selected_ids)].sort_values('Score', ascending=False, ignore_index=True)
-
-            st.session_state.agg_final_scored = agg_final  # simpan semua skor untuk perbandingan
-
-            st.success(f"✅ Optimasi selesai! {len(st.session_state.selected_df):,} toko terpilih.")
-
-            st.balloons()
-
-
-
-# ============================================================
-
-# HASIL & ANALISIS
-
-# ============================================================
-
-if 'selected_df' in st.session_state:
-
-    selected_df = st.session_state.selected_df
-
-    total_eligible_stores = st.session_state.get('total_eligible_stores', 1)
-
-    total_eligible_clusters = st.session_state.get('total_eligible_clusters', 1)
-
-    percent_selected = (len(selected_df) / total_eligible_stores) * 100 if total_eligible_stores > 0 else 0
-
-    unique_clusters_selected = selected_df['Cluster Pareto'].nunique()
-
-    percent_clusters = (unique_clusters_selected / total_eligible_clusters) * 100 if total_eligible_clusters > 0 else 0
-
-    budget_used = selected_df['Estimated_Cost'].sum()
-
-    budget_max = st.session_state.get('max_budget_value_for_run', 1)
-
-    budget_utilization = (budget_used / budget_max * 100) if budget_max > 0 else 0
-
-
-
-    # ---- Tab navigasi hasil ----
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-
-        "📊 Ringkasan & Komposisi",
-
-        "📈 Analisis Kontribusi",
-
-        "🔍 Perbandingan Toko",
-
-        "📅 Tren Bulanan",
-
-        "📋 Data Lengkap & Export"
-
-    ])
-
-
-
-    # ======================================================
-
-    # TAB 1: RINGKASAN
-
-    # ======================================================
-
-    with tab1:
-
-        st.markdown('<div class="section-header">✅ Ringkasan Hasil Seleksi</div>', unsafe_allow_html=True)
-
-
-
-        m1, m2, m3, m4 = st.columns(4)
-
-        m1.metric("Toko Terpilih", f"{len(selected_df):,}", f"{percent_selected:.1f}% dari {total_eligible_stores:,}")
-
-        m2.metric("Cluster Terwakili", f"{unique_clusters_selected}", f"{percent_clusters:.0f}% dari {total_eligible_clusters}")
-
-        m3.metric("Estimasi Budget Bulanan", f"Rp {budget_used:,.0f}")
-
-        m4.metric("Utilisasi Anggaran", f"{budget_utilization:.1f}%")
-
-
-
-        st.markdown("---")
-
-        st.subheader("Komposisi Cluster Pareto")
-
-        if not selected_df.empty:
-
-            cluster_summary = selected_df['Cluster Pareto'].value_counts().reset_index()
-
-            cluster_summary.columns = ['Cluster Pareto', 'Jumlah Toko']
-
-            cluster_summary['Persentase'] = (cluster_summary['Jumlah Toko'] / len(selected_df) * 100).round(2)
-
-            cluster_summary['Estimasi Budget'] = cluster_summary['Cluster Pareto'].map(
-
-                selected_df.groupby('Cluster Pareto')['Estimated_Cost'].sum().to_dict()
-
-            )
-
-
-
-            cc1, cc2 = st.columns(2)
-
-            with cc1:
-
-                st.dataframe(cluster_summary.style.format({'Persentase': '{:.2f}%', 'Estimasi Budget': 'Rp {:,.0f}'}),
-
-                             use_container_width=True)
-
-            with cc2:
-
-                pie_chart = alt.Chart(cluster_summary).mark_arc(innerRadius=50).encode(
-
-                    theta=alt.Theta('Jumlah Toko:Q'),
-
-                    color=alt.Color('Cluster Pareto:N'),
-
-                    tooltip=['Cluster Pareto', 'Jumlah Toko', 'Persentase']
-
-                ).properties(height=280, title="Distribusi Cluster")
-
-                st.altair_chart(pie_chart, use_container_width=True)
-
-
-
-        st.subheader("Distribusi Geografis")
-
-        geo1, geo2 = st.columns(2)
-
-        with geo1:
-
-            prov_dist = selected_df['Provinsi Toko'].value_counts().reset_index()
-
-            prov_dist.columns = ['Provinsi', 'Jumlah Toko']
-
-            st.markdown("**Per Provinsi**")
-
-            prov_chart = alt.Chart(prov_dist.head(15)).mark_bar().encode(
-
-                x=alt.X('Jumlah Toko:Q'),
-
-                y=alt.Y('Provinsi:N', sort='-x'),
-
-                color=alt.Color('Jumlah Toko:Q', scale=alt.Scale(scheme='blues')),
-
-                tooltip=['Provinsi', 'Jumlah Toko']
-
-            ).properties(height=350)
-
-            st.altair_chart(prov_chart, use_container_width=True)
-
-        with geo2:
-
-            area_dist = selected_df['Area AP Toko'].value_counts().reset_index()
-
-            area_dist.columns = ['Area AP', 'Jumlah Toko']
-
-            st.markdown("**Per Area AP**")
-
-            area_chart = alt.Chart(area_dist).mark_bar(color='#FF6B6B').encode(
-
-                x=alt.X('Jumlah Toko:Q'),
-
-                y=alt.Y('Area AP:N', sort='-x'),
-
-                tooltip=['Area AP', 'Jumlah Toko']
-
-            ).properties(height=350)
-
-            st.altair_chart(area_chart, use_container_width=True)
-
-
-
-    # ======================================================
-
-    # TAB 2: ANALISIS KONTRIBUSI
-
-    # ======================================================
-
-    with tab2:
-
-        st.markdown('<div class="section-header">📈 Analisis Kontribusi & Efisiensi</div>', unsafe_allow_html=True)
-
-
-
-        if not selected_df.empty:
-
-            total_score = selected_df['Score'].sum()
-
-            total_estimated_budget = selected_df['Estimated_Cost'].sum()
-
-            selected_df['Kontribusi_Skor_%'] = (selected_df['Score'] / total_score * 100)
-
-            selected_df['Kontribusi_Budget_%'] = (selected_df['Estimated_Cost'] / (total_estimated_budget + 1e-9) * 100)
-
-            selected_df['Efisiensi (Skor/Juta)'] = (selected_df['Score'] / (selected_df['Estimated_Cost'] + 1e-9)) * 1_000_000
-
-            selected_df['ID_dan_Nama'] = selected_df['ID Toko'].astype(str) + ' - ' + selected_df['Nama Toko']
-
-
-
-            c1, c2 = st.columns(2)
-
-            with c1:
-
-                st.write("**Top 10 Kontributor Skor**")
-
-                top_score = selected_df.nlargest(10, 'Kontribusi_Skor_%')
-
-                chart_s = alt.Chart(top_score).mark_bar(color='#4CAF50').encode(
-
-                    x=alt.X('Kontribusi_Skor_%:Q', title='Kontribusi Skor (%)'),
-
-                    y=alt.Y('ID_dan_Nama:N', sort='-x', title=''),
-
-                    tooltip=['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Kontribusi_Skor_%']
-
-                )
-
-                st.altair_chart(chart_s, use_container_width=True)
-
-            with c2:
-
-                st.write("**Top 10 Kontributor Budget**")
-
-                top_budget = selected_df.nlargest(10, 'Kontribusi_Budget_%')
-
-                chart_b = alt.Chart(top_budget).mark_bar(color='#FF9800').encode(
-
-                    x=alt.X('Kontribusi_Budget_%:Q', title='Kontribusi Budget (%)'),
-
-                    y=alt.Y('ID_dan_Nama:N', sort='-x', title=''),
-
-                    tooltip=['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Kontribusi_Budget_%']
-
-                )
-
-                st.altair_chart(chart_b, use_container_width=True)
-
-
-
-            st.subheader("Scatter: Skor vs Biaya (Efisiensi)")
-
-            chart_scatter = alt.Chart(selected_df).mark_circle().encode(
-
-                x=alt.X('Estimated_Cost:Q', title='Estimasi Biaya (Rp)'),
-
-                y=alt.Y('Score:Q', title='Skor Performa'),
-
-                color=alt.Color('Cluster Pareto:N'),
-
-                size=alt.Size('Avg_Ton:Q', title='Rata-rata Tonase'),
-
-                tooltip=['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Provinsi Toko', 'Score', 'Estimated_Cost', 'Efisiensi (Skor/Juta)']
-
-            ).interactive().properties(height=350)
-
-            st.altair_chart(chart_scatter, use_container_width=True)
-
-
-
-            st.subheader("Top 20 Toko Paling Efisien (Skor per 1 Juta Biaya)")
-
-            top_eff = selected_df.nlargest(20, 'Efisiensi (Skor/Juta)')[['ID Toko', 'Nama Toko', 'Cluster Pareto', 'Score', 'Estimated_Cost', 'Efisiensi (Skor/Juta)']].copy()
-
-            st.dataframe(top_eff.style.format({'Estimated_Cost': 'Rp {:,.0f}', 'Efisiensi (Skor/Juta)': '{:,.2f}', 'Score': '{:.4f}'}), use_container_width=True)
-
-
-
-    # ======================================================
-
-    # TAB 3: PERBANDINGAN TOKO (FITUR BARU)
-
-    # ======================================================
-
-    with tab3:
-
-        st.markdown('<div class="section-header">🔍 Perbandingan Toko Side-by-Side</div>', unsafe_allow_html=True)
-
-        st.markdown("Pilih 2–4 toko untuk dibandingkan detailnya secara langsung.")
-
-
-
-        all_toko_options = (selected_df['ID Toko'] + ' — ' + selected_df['Nama Toko']).tolist()
-
-        toko_dipilih = st.multiselect("Pilih toko untuk dibandingkan:", all_toko_options, default=all_toko_options[:min(3, len(all_toko_options))], max_selections=4)
-
-
-
-        if toko_dipilih:
-
-            ids_dipilih = [t.split(' — ')[0] for t in toko_dipilih]
-
-            compare_df = selected_df[selected_df['ID Toko'].isin(ids_dipilih)].copy()
-
-
-
-            # Kartu perbandingan
-
-            cols_compare = st.columns(len(compare_df))
-
-            metrics_to_show = [
-
-                ('Score', 'Skor Performa', '{:.4f}'),
-
-                ('Avg_Ton', 'Rata-rata Tonase/Bulan', '{:.2f} Ton'),
-
-                ('Avg_Trx', 'Rata-rata Transaksi/Bulan', '{:.1f}'),
-
-                ('Ton_Growth', 'Growth Tonase', '{:.2%}'),
-
-                ('Ratio_vs_Cluster', 'Ratio vs Cluster', '{:.2f}x'),
-
-                ('Estimated_Cost', 'Estimasi Biaya/Bulan', 'Rp {:,.0f}'),
-
-                ('Efisiensi (Skor/Juta)', 'Efisiensi', '{:,.2f}'),
-
-            ]
-
-
-
-            for col_ui, (_, row) in zip(cols_compare, compare_df.iterrows()):
-
-                with col_ui:
-
-                    st.markdown(f"### 🏪 {row['Nama Toko']}")
-
-                    st.markdown(f"**ID:** {row['ID Toko']}  \n**Cluster:** {row['Cluster Pareto']}  \n**Provinsi:** {row['Provinsi Toko']}  \n**Area AP:** {row['Area AP Toko']}")
-
-                    st.markdown("---")
-
-                    for field, label, fmt in metrics_to_show:
-
-                        val = row.get(field, 'N/A') if hasattr(row, 'get') else row[field] if field in row.index else 'N/A'
-
-                        if isinstance(val, (int, float)):
-
-                            st.metric(label, fmt.format(val))
-
-                        else:
-
-                            st.metric(label, str(val))
-
-
-
-            # Radar chart perbandingan menggunakan bar chart grouped
-
-            st.markdown("---")
-
-            st.subheader("Visualisasi Perbandingan Multi-Dimensi")
-
-            compare_metrics = ['Score', 'Avg_Ton', 'Ton_Growth', 'Avg_Trx', 'Ratio_vs_Cluster']
-
-            radar_data = []
-
-            for _, row in compare_df.iterrows():
-
-                for m in compare_metrics:
-
-                    radar_data.append({
-
-                        'Toko': row['Nama Toko'],
-
-                        'Metrik': m,
-
-                        'Nilai_Norm': float(normalize(compare_df[m])[compare_df['ID Toko'] == row['ID Toko']].values[0])
-
-                    })
-
-            radar_df = pd.DataFrame(radar_data)
-
-            radar_chart = alt.Chart(radar_df).mark_bar().encode(
-
-                x=alt.X('Toko:N', title=''),
-
-                y=alt.Y('Nilai_Norm:Q', title='Nilai Ternormalisasi (0-1)'),
-
-                color=alt.Color('Toko:N'),
-
-                column=alt.Column('Metrik:N'),
-
-                tooltip=['Toko', 'Metrik', 'Nilai_Norm']
-
-            ).properties(width=100, height=200)
-
-            st.altair_chart(radar_chart)
-
-
-
-            # Tren perbandingan toko terpilih
-
-            if 'grouped' in st.session_state:
-
-                st.subheader("Tren Tonase Toko yang Dibandingkan")
-
-                grouped_data = st.session_state.grouped.copy()
-
-                grouped_data['ID Toko'] = grouped_data['ID Toko'].astype(str)
-
-                trend_compare = grouped_data[grouped_data['ID Toko'].isin(ids_dipilih)]
-
-                if not trend_compare.empty:
-
-                    trend_c = alt.Chart(trend_compare).mark_line(point=True).encode(
-
-                        x=alt.X('Bulan:N', sort=None, title='Bulan'),
-
-                        y=alt.Y('Total_Ton:Q', title='Total Tonase'),
-
-                        color=alt.Color('Nama Toko:N'),
-
-                        tooltip=['ID Toko', 'Nama Toko', 'Bulan', 'Total_Ton', 'Jumlah_Transaksi']
-
-                    ).interactive().properties(height=300)
-
-                    st.altair_chart(trend_c, use_container_width=True)
-
-
-
-    # ======================================================
-
-    # TAB 4: TREN BULANAN
-
-    # ======================================================
-
-    with tab4:
-
-        st.markdown('<div class="section-header">📅 Analisis Tren Performa Bulanan</div>', unsafe_allow_html=True)
-
-
-
-        if 'grouped' in st.session_state and not selected_df.empty:
-
-            grouped_monthly_data = st.session_state.grouped.copy()
-
-            grouped_monthly_data['ID Toko'] = grouped_monthly_data['ID Toko'].astype(str)
-
-            trend_data = grouped_monthly_data[grouped_monthly_data['ID Toko'].isin(selected_df['ID Toko'])]
-
-
-
-            st.subheader("Tren Agregat Semua Toko Terpilih")
-
-            agg_trend = trend_data.groupby('Bulan').agg(
-
-                Total_Ton=('Total_Ton', 'sum'),
-
-                Total_Transaksi=('Jumlah_Transaksi', 'sum'),
-
-                Jumlah_Toko_Aktif=('ID Toko', 'nunique')
-
-            ).reset_index()
-
-
-
-            tline = alt.Chart(agg_trend).mark_line(point=True, color='#1976D2').encode(
-
-                x=alt.X('Bulan:N', sort=None),
-
-                y=alt.Y('Total_Ton:Q', title='Total Tonase'),
-
-                tooltip=['Bulan', 'Total_Ton', 'Total_Transaksi', 'Jumlah_Toko_Aktif']
-
-            ).properties(height=250)
-
-            tbar = alt.Chart(agg_trend).mark_bar(opacity=0.3, color='#90CAF9').encode(
-
-                x=alt.X('Bulan:N', sort=None),
-
-                y=alt.Y('Jumlah_Toko_Aktif:Q', title='Jumlah Toko Aktif'),
-
-            )
-
-            st.altair_chart(tline, use_container_width=True)
-
-
-
-            st.subheader("Tren per Cluster Pareto")
-
-            sel_cluster = selected_df[['ID Toko', 'Cluster Pareto']].drop_duplicates(subset=['ID Toko']).copy()
-
-            trend_merged = trend_data.drop(columns=['Cluster Pareto'], errors='ignore').merge(
-
-                sel_cluster, on='ID Toko', how='left'
-
-            ).dropna(subset=['Cluster Pareto'])
-
-            cluster_trend = trend_merged.groupby(['Bulan', 'Cluster Pareto'])['Total_Ton'].sum().reset_index()
-
-            cluster_trend_chart = alt.Chart(cluster_trend).mark_line(point=True).encode(
-
-                x=alt.X('Bulan:N', sort=None),
-
-                y=alt.Y('Total_Ton:Q', title='Total Tonase'),
-
-                color='Cluster Pareto:N',
-
-                tooltip=['Bulan', 'Cluster Pareto', 'Total_Ton']
-
-            ).interactive().properties(height=300)
-
-            st.altair_chart(cluster_trend_chart, use_container_width=True)
-
-
-
-            st.subheader("Perbandingan Tren per Toko")
-
-            list_toko_terpilih = selected_df['Nama Toko'].unique().tolist()
-
-            toko_untuk_dibandingkan = st.multiselect(
-
-                "Pilih toko (maks 10):", list_toko_terpilih, default=list_toko_terpilih[:5], max_selections=10
-
-            )
-
-            if toko_untuk_dibandingkan:
-
-                comp_data = trend_data[trend_data['Nama Toko'].isin(toko_untuk_dibandingkan)]
-
-                tc = alt.Chart(comp_data).mark_line(point=True).encode(
-
-                    x=alt.X('Bulan:N', sort=None),
-
-                    y=alt.Y('Total_Ton:Q', title='Total Tonase'),
-
-                    color=alt.Color('Nama Toko:N'),
-
-                    tooltip=['ID Toko', 'Nama Toko', 'Bulan', 'Total_Ton', 'Jumlah_Transaksi']
-
-                ).interactive().properties(height=350)
-
-                st.altair_chart(tc, use_container_width=True)
-
-
-
-    # ======================================================
-
-    # TAB 5: DATA LENGKAP & EXPORT
-
-    # ======================================================
-
-    with tab5:
-
-        st.markdown('<div class="section-header">📋 Data Lengkap & Export</div>', unsafe_allow_html=True)
-
-
-
-        # Filter pencarian di tabel
-
-        search_q = st.text_input("🔎 Cari berdasarkan ID / Nama Toko / Provinsi", "")
-
-        display_df = selected_df.copy()
-
-        if search_q:
-
+        # ── Benchmark table ──────────────────────────────────────
+        st.markdown('<div class="section-hdr">Tabel Benchmark 6 Metode</div>', unsafe_allow_html=True)
+
+        show_bench = bench[[
+            'Metode', 'N_Toko', 'Total_Score', 'Avg_Score',
+            'Budget_Util_pct', 'Total_Est_Ton',
+            'Delta_Ton_vs_Manual_pct', 'Ton_Tersembunyi',
+            'Overlap_Manual_pct', 'Feasible'
+        ]].copy()
+
+        def highlight_feasible(row):
+            base = [''] * len(row)
+            if row['Feasible'] == '❌ Infeasible':
+                return ['background-color:#FEF2F2'] * len(row)
+            if 'ILP-A' in str(row['Metode']):
+                return ['background-color:#ECFDF5'] * len(row)
+            return base
+
+        st.dataframe(
+            show_bench.style
+            .format({
+                'Total_Score': '{:,.2f}', 'Avg_Score': '{:.4f}',
+                'Budget_Util_pct': '{:.2f}%', 'Total_Est_Ton': '{:,.2f}',
+                'Delta_Ton_vs_Manual_pct': '{:+.2f}%',
+                'Ton_Tersembunyi': '{:,.2f}', 'Overlap_Manual_pct': '{:.1f}%',
+            })
+            .apply(highlight_feasible, axis=1),
+            use_container_width=True, hide_index=True
+        )
+
+        st.markdown(f"""
+        <div class="card card-amber">
+        <b>Catatan Feasibilitas:</b> Metode dengan Budget Utilization >103% tidak dapat diterapkan
+        (anggaran melebihi batas). Top-N Tonnage dan Greedy biasanya infeasible.
+        Di antara metode yang feasible, <b>ILP-A Mirror</b> menghasilkan portfolio terbaik
+        berdasarkan riset (validasi prospektif Jan–Mar 2026: Δ=+21.24%, p&lt;0.001, r=0.180).
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Charts ───────────────────────────────────────────────
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            fig_s = px.bar(bench, x='Metode', y='Total_Score',
+                           color='Feasible',
+                           color_discrete_map={'✅ Ya':'#10B981','❌ Infeasible':'#EF4444'},
+                           title='Total Composite Score per Metode',
+                           template='plotly_white')
+            fig_s.update_layout(showlegend=True, height=320, xaxis_tickangle=-20)
+            st.plotly_chart(fig_s, use_container_width=True)
+        with col_c2:
+            fig_t = px.bar(bench, x='Metode', y='Total_Est_Ton',
+                           color='Feasible',
+                           color_discrete_map={'✅ Ya':'#3B82F6','❌ Infeasible':'#EF4444'},
+                           title='Total Estimasi Tonase Portfolio',
+                           template='plotly_white')
+            fig_t.update_layout(showlegend=False, height=320, xaxis_tickangle=-20)
+            st.plotly_chart(fig_t, use_container_width=True)
+
+        # ── Cluster composition heatmap ──────────────────────────
+        st.markdown('<div class="section-hdr">Komposisi Cluster per Metode (%)</div>', unsafe_allow_html=True)
+        cl_cols = [c for c in bench.columns if c.startswith('Cl_')]
+        if cl_cols:
+            hm = bench.set_index('Metode')[cl_cols]
+            hm.columns = [c.replace('Cl_','') for c in cl_cols]
+            fig_hm = px.imshow(hm.T, color_continuous_scale='Blues',
+                                text_auto='.1f', template='plotly_white',
+                                title='Heatmap Komposisi Cluster (%)')
+            fig_hm.update_layout(height=280)
+            st.plotly_chart(fig_hm, use_container_width=True)
+
+        # ── Selected stores table ────────────────────────────────
+        st.markdown('<div class="section-hdr">Daftar Toko ILP-A Terpilih</div>', unsafe_allow_html=True)
+        search = st.text_input("🔎 Cari ID / Nama / Provinsi", "")
+        disp = selected_final.copy()
+        if search:
             mask = (
-
-                display_df['ID Toko'].str.contains(search_q, case=False, na=False) |
-
-                display_df['Nama Toko'].str.contains(search_q, case=False, na=False) |
-
-                display_df['Provinsi Toko'].str.contains(search_q, case=False, na=False)
-
+                disp[COL_ID].str.contains(search, case=False, na=False) |
+                disp[COL_NAMA].str.contains(search, case=False, na=False) |
+                disp[COL_PROV].str.contains(search, case=False, na=False)
             )
+            disp = disp[mask]
+            st.info(f"{len(disp):,} hasil untuk '{search}'")
 
-            display_df = display_df[mask]
+        show_cols = [COL_ID, COL_NAMA, COL_CLUSTER, COL_PROV, COL_AREA_AP,
+                     'Avg_Ton', 'Avg_Trx', 'Ton_Growth', 'Score', 'Estimated_Cost', 'Is_New']
+        avail = [c for c in show_cols if c in disp.columns]
+        st.dataframe(
+            disp[avail].style.format({
+                'Avg_Ton': '{:.2f}', 'Avg_Trx': '{:.1f}',
+                'Ton_Growth': '{:.3f}', 'Score': '{:.4f}',
+                'Estimated_Cost': '{:,.0f}',
+            }),
+            use_container_width=True, height=380, hide_index=True
+        )
 
-            st.info(f"Menampilkan {len(display_df):,} hasil pencarian untuk: '{search_q}'")
+# ════════════════════════════════════════════════════════════════════
+# TAB 4: TREND BULANAN
+# ════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown('<div class="section-hdr">Tren Performa Bulanan</div>', unsafe_allow_html=True)
 
+    monthly_data = st.session_state.get('monthly', monthly)
+    ilpa_set = set(st.session_state.get('ilpa_ids', []))
+    manual_set = set(st.session_state.get('manual_ids', []))
 
+    if monthly_data is not None and not monthly_data.empty:
+        # Aggregate trend for ILP-A selected stores
+        trend_ilpa = monthly_data[monthly_data[COL_ID].isin(ilpa_set)].copy()
+        agg_trend = (trend_ilpa.groupby('Bulan')
+                     .agg(Total_Ton=('Total_Ton','sum'),
+                          Total_Trx=('Jumlah_Trx','sum'),
+                          N_Aktif=(COL_ID,'nunique'))
+                     .reset_index())
 
-        show_cols = [
+        fig_tr = go.Figure()
+        fig_tr.add_trace(go.Scatter(
+            x=agg_trend['Bulan'], y=agg_trend['Total_Ton'],
+            mode='lines+markers', name='Total Tonase',
+            line=dict(color='#3B82F6', width=2), marker=dict(size=6)
+        ))
+        fig_tr.update_layout(title='Tren Tonase Agregat — Toko ILP-A',
+                               template='plotly_white', height=280)
+        st.plotly_chart(fig_tr, use_container_width=True)
 
-            'ID Toko', 'Nama Toko', 'Cluster Pareto', 'Area AP Toko', 'Provinsi Toko', 'Area Toko',
+        # Per-cluster trend
+        sel_cluster_map = agg[agg[COL_ID].isin(ilpa_set)][[COL_ID, COL_CLUSTER]].set_index(COL_ID)[COL_CLUSTER].to_dict()
+        trend_ilpa['Cluster'] = trend_ilpa[COL_ID].map(sel_cluster_map)
+        cl_trend = (trend_ilpa.dropna(subset=['Cluster'])
+                    .groupby(['Bulan','Cluster'])['Total_Ton'].sum().reset_index())
+        fig_cl = px.line(cl_trend, x='Bulan', y='Total_Ton', color='Cluster',
+                          color_discrete_map=CLUSTER_COLORS,
+                          title='Tren Tonase per Cluster Pareto',
+                          template='plotly_white', markers=True)
+        fig_cl.update_layout(height=300)
+        st.plotly_chart(fig_cl, use_container_width=True)
 
-            'Avg_Ton', 'Avg_Trx', 'Ton_Growth', 'Score', 'Estimated_Cost',
+        # Per-store trend (up to 10)
+        st.markdown('<div class="section-hdr">Tren Toko Individual</div>', unsafe_allow_html=True)
+        store_opts = agg[agg[COL_ID].isin(ilpa_set)][COL_NAMA].unique().tolist()
+        sel_stores = st.multiselect("Pilih toko (max 10)", store_opts,
+                                     default=store_opts[:5], max_selections=10)
+        if sel_stores:
+            trend_indiv = monthly_data[monthly_data[COL_NAMA].isin(sel_stores)]
+            fig_ind = px.line(trend_indiv, x='Bulan', y='Total_Ton', color=COL_NAMA,
+                               title='Tren Tonase per Toko', template='plotly_white',
+                               markers=True)
+            fig_ind.update_layout(height=350)
+            st.plotly_chart(fig_ind, use_container_width=True)
 
-            'Kontribusi_Skor_%', 'Kontribusi_Budget_%', 'Efisiensi (Skor/Juta)'
+# ════════════════════════════════════════════════════════════════════
+# TAB 5: SENSITIVITY ANALYSIS
+# ════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown('<div class="section-hdr">Sensitivity Analysis — Robustness Model</div>', unsafe_allow_html=True)
 
+    if 'ilpa_ids' not in st.session_state:
+        st.info("Jalankan Optimasi terlebih dahulu.")
+    else:
+        baseline_set = set(st.session_state['ilpa_ids'])
+
+        st.markdown("**Weight Perturbation Sensitivity (Jaccard vs ILP-A Baseline)**")
+        sens_scenarios = [
+            ('Baseline',     W1,        W2,        W3),
+            ('Ratio +10pp',  W1+0.10,   W2-0.05,   W3-0.05),
+            ('Ratio +20pp',  W1+0.20,   W2-0.10,   W3-0.10),
+            ('Trx +10pp',    W1-0.05,   W2+0.10,   W3-0.05),
+            ('Trx +20pp',    W1-0.10,   W2+0.20,   W3-0.10),
+            ('Growth +10pp', W1-0.05,   W2-0.05,   W3+0.10),
+            ('Growth +20pp', W1-0.10,   W2-0.10,   W3+0.20),
+            ('Equal Weight', 1/3,       1/3,        1/3),
         ]
 
-        avail_cols = [c for c in show_cols if c in display_df.columns]
+        with st.spinner("Menghitung sensitivity bobot..."):
+            sens_rows = []
+            for name, nw1, nw2, nw3 in sens_scenarios:
+                total = max(nw1 + nw2 + nw3, 1e-9)
+                nw1, nw2, nw3 = nw1/total, nw2/total, nw3/total
+                agg_s = compute_scores(agg.copy(), nw1, nw2, nw3)
+                sel_s = run_ilp(agg_s, N_MAX, BUDGET, cluster_pcts, 1.0)
+                j = jaccard(baseline_set, sel_s)
+                sens_rows.append({
+                    'Skenario': name, 'w1': round(nw1,4), 'w2': round(nw2,4), 'w3': round(nw3,4),
+                    'N_Berubah': len(set(sel_s) - baseline_set),
+                    'Jaccard': round(j, 4),
+                    'Robust': '✅ Ya' if j >= 0.75 else '❌ Tidak',
+                })
+        sens_df = pd.DataFrame(sens_rows)
 
+        st.dataframe(sens_df.style
+            .format({'w1':'{:.4f}','w2':'{:.4f}','w3':'{:.4f}','Jaccard':'{:.4f}'})
+            .apply(lambda r: ['background-color:#ECFDF5' if r['Robust']=='✅ Ya'
+                               else 'background-color:#FEF2F2']*len(r), axis=1),
+            use_container_width=True, hide_index=True)
 
+        fig_j = px.bar(sens_df, x='Skenario', y='Jaccard',
+                        color='Robust', color_discrete_map={'✅ Ya':'#10B981','❌ Tidak':'#EF4444'},
+                        title='Jaccard Similarity vs ILP-A Baseline',
+                        template='plotly_white')
+        fig_j.add_hline(y=0.75, line_dash='dash', line_color='#F59E0B',
+                         annotation_text='Robustness Threshold (0.75)')
+        fig_j.update_layout(height=300, xaxis_tickangle=-20)
+        st.plotly_chart(fig_j, use_container_width=True)
 
-        fmt_map = {
+        avg_jac = sens_df[sens_df['Skenario']!='Baseline']['Jaccard'].mean()
+        st.markdown(f"""
+        <div class="card card-green">
+        📊 <b>Rata-rata Jaccard:</b> {avg_jac:.4f}
+        &nbsp;|&nbsp; <b>Min Jaccard:</b> {sens_df['Jaccard'].min():.4f}
+        &nbsp;|&nbsp; Penelitian menemukan batas robustness cluster di λ=1.20x (Jaccard=0.783).
+        </div>
+        """, unsafe_allow_html=True)
 
-            'Estimated_Cost': 'Rp {:,.0f}',
+# ════════════════════════════════════════════════════════════════════
+# TAB 6: EXPORT
+# ════════════════════════════════════════════════════════════════════
+with tab6:
+    st.markdown('<div class="section-hdr">Download Hasil</div>', unsafe_allow_html=True)
 
-            'Kontribusi_Skor_%': '{:.2f}%',
+    if 'opt_results' not in st.session_state:
+        st.info("Jalankan Optimasi terlebih dahulu.")
+    else:
+        bench = st.session_state['opt_results']
+        sel   = st.session_state['selected_final']
 
-            'Kontribusi_Budget_%': '{:.2f}%',
+        sheets = {'Benchmark_6Metode': bench, 'ILP_A_Terpilih': sel}
+        if 'sens_df' in dir():
+            sheets['Sensitivity_Bobot'] = sens_df
 
-            'Efisiensi (Skor/Juta)': '{:,.2f}',
-
-            'Score': '{:.4f}',
-
-            'Avg_Ton': '{:.2f}',
-
-            'Avg_Trx': '{:.1f}',
-
-            'Ton_Growth': '{:.2%}',
-
-        }
-
-        active_fmt = {k: v for k, v in fmt_map.items() if k in avail_cols}
-
-        st.dataframe(display_df[avail_cols].style.format(active_fmt), use_container_width=True, height=400)
-
-
-
-        st.markdown("---")
-
-        st.subheader("⬇️ Download Hasil")
-
-
-
-        ecol1, ecol2 = st.columns(2)
-
-        with ecol1:
-
-            # Multi-sheet Excel
-
-            cluster_summary_exp = selected_df['Cluster Pareto'].value_counts().reset_index()
-
-            cluster_summary_exp.columns = ['Cluster Pareto', 'Jumlah Toko']
-
-            trend_exp = None
-
-            if 'grouped' in st.session_state:
-
-                g = st.session_state.grouped.copy()
-
-                g['ID Toko'] = g['ID Toko'].astype(str)
-
-                trend_exp = g[g['ID Toko'].isin(selected_df['ID Toko'])]
-
-
-
-            excel_bytes = to_excel_bytes_multi(selected_df[avail_cols], cluster_summary_exp, trend_exp)
-
+        col_e1, col_e2, col_e3 = st.columns(3)
+        with col_e1:
             st.download_button(
-
-                "📊 Download Excel (Multi-Sheet)",
-
-                data=excel_bytes,
-
-                file_name=f"optimasi_loyalty_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
+                "📊 Excel Multi-Sheet",
+                data=to_excel_multi(sheets),
+                file_name=f"loyalty_optimizer_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 use_container_width=True
-
+            )
+        with col_e2:
+            st.download_button(
+                "📄 CSV Toko ILP-A",
+                data=sel.to_csv(index=False).encode('utf-8-sig'),
+                file_name=f"toko_ilp_a_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime='text/csv',
+                use_container_width=True
+            )
+        with col_e3:
+            buf = BytesIO()
+            sel.to_parquet(buf, index=False)
+            st.download_button(
+                "🗜️ Parquet Toko ILP-A",
+                data=buf.getvalue(),
+                file_name=f"toko_ilp_a_{datetime.now().strftime('%Y%m%d_%H%M')}.parquet",
+                mime='application/octet-stream',
+                use_container_width=True
             )
 
-        with ecol2:
+        # Executive summary
+        ilpa_row = bench[bench['Metode']=='ILP-A Mirror ★'].iloc[0]
+        man_row  = bench[bench['Metode']=='Manual (Existing)'].iloc[0]
+        st.markdown(f"""
+        <div class="card card-green" style="margin-top:16px;">
+            <div class="section-hdr">Executive Summary — ILP-A Mirror</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
+                <div>
+                    <div style="font-size:12px;color:#6B7280;">Toko Dipilih</div>
+                    <div style="font-size:22px;font-weight:700;color:#1E293B;">{ilpa_row['N_Toko']:,}</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#6B7280;">Budget Utilization</div>
+                    <div style="font-size:22px;font-weight:700;color:#1E293B;">{ilpa_row['Budget_Util_pct']:.1f}%</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#6B7280;">Δ Ton vs Manual</div>
+                    <div style="font-size:22px;font-weight:700;color:#059669;">+{ilpa_row['Delta_Ton_vs_Manual_pct']:.2f}%</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#6B7280;">Total Score</div>
+                    <div style="font-size:22px;font-weight:700;color:#1E293B;">{ilpa_row['Total_Score']:,.2f}</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#6B7280;">Hidden Tonnage</div>
+                    <div style="font-size:22px;font-weight:700;color:#3B82F6;">{ilpa_row['Ton_Tersembunyi']:,.0f}</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#6B7280;">Avg Score / Toko</div>
+                    <div style="font-size:22px;font-weight:700;color:#1E293B;">{ilpa_row['Avg_Score']:.4f}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-            # CSV
-
-            csv_bytes = selected_df[avail_cols].to_csv(index=False).encode('utf-8-sig')
-
-            st.download_button(
-
-                "📄 Download CSV",
-
-                data=csv_bytes,
-
-                file_name=f"optimasi_loyalty_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-
-                mime="text/csv",
-
-                use_container_width=True
-
-            )
-
-
-
-        # Download Parquet
-
-        st.markdown("")
-
-        parquet_buffer = BytesIO()
-
-        selected_df[avail_cols].to_parquet(parquet_buffer, index=False)
-
-        st.download_button(
-
-            "🗜️ Download Parquet (kompak)",
-
-            data=parquet_buffer.getvalue(),
-
-            file_name=f"optimasi_loyalty_{datetime.now().strftime('%Y%m%d_%H%M')}.parquet",
-
-            mime="application/octet-stream",
-
-            use_container_width=True
-
-        )
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style="text-align:center;color:#94A3B8;font-size:12px;padding:8px 0;">
+Loyalty Store Selection Optimizer v2.0 · Research Edition · MCS + ILP + DSR
+</div>
+""", unsafe_allow_html=True)
