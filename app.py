@@ -938,7 +938,9 @@ with tab4:
         # Per cluster
         st.subheader("Tren per Cluster Pareto")
         sel_cl = selected_df[['ID Toko', 'Cluster Pareto']].drop_duplicates()
-        tr_merged = trend.merge(sel_cl, on='ID Toko', how='left').dropna(
+        # Drop Cluster Pareto dari trend sebelum merge — hindari kolom _x/_y
+        trend_no_cl = trend.drop(columns=['Cluster Pareto'], errors='ignore')
+        tr_merged = trend_no_cl.merge(sel_cl, on='ID Toko', how='left').dropna(
             subset=['Cluster Pareto'])
         cl_trend = (tr_merged.groupby(['Bulan', 'Cluster Pareto'])['Total_Ton']
                     .sum().reset_index())
