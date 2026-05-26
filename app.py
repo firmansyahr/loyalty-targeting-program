@@ -222,10 +222,44 @@ if uploaded_file:
                 if df.empty: st.warning("Tidak ada data valid."); st.stop()
 
                 df['Bulan']          = df['Tanggal Transaksi'].dt.to_period('M').astype(str)
-                df['Brand_Category'] = df.apply(
-                    lambda r: get_brand_category(r['Area AP Toko'],r['Brands'],r['Provinsi Toko']), axis=1)
-                df['Reward_per_Ton'] = df.apply(
-                    lambda r: get_reward(r['Cluster Pareto'],r['Brand_Category']), axis=1)
+                # FIX 1: Brand category — vectorized lookup (bukan .apply row-by-row)
+                # Buat lookup key: Area_upper + '|' + Prov_upper
+                df['_au'] = df['Area AP Toko'].str.strip().str.upper()
+                df['_pu'] = df['Provinsi Toko'].str.strip().str.upper()
+                df['_bu'] = df['Brands'].str.strip().str.upper()
+
+                def _cat_vec(au, pu, bu):
+                    am = BRAND_MAP_BY_PROV.get(au)
+                    if am is None: return 'Other'
+                    pm = am.get(pu)
+                    if pm is None:
+                        for k in am:
+                            if k in pu or pu in k: pm = am[k]; break
+                    if pm is None:
+                        fb = {'SP':{'main':['PADANG'],'companion':['DYNAMIX','ANDALAS','BATURAJA']},
+                              'SMBR':{'main':['BATURAJA'],'companion':['DYNAMIX','PADANG']},
+                              'ST':{'main':['TONASA'],'companion':['GRESIK']}}
+                        pm = fb.get(au, {'main':[],'companion':[]})
+                    if any(k in bu for k in pm['main']): return 'Main Brand'
+                    if pm['companion'] and any(k in bu for k in pm['companion']): return 'Companion Brand'
+                    if au == 'ST' and 'MERDEKA' in bu and pu in FB_PROVINCES: return 'Fighting Brand'
+                    return 'Other'
+
+                # Buat lookup key unik → hitung sekali per kombinasi, bukan per baris
+                df['_key'] = df['_au'] + '|||' + df['_pu'] + '|||' + df['_bu']
+                unique_keys = df[['_key','_au','_pu','_bu']].drop_duplicates('_key')
+                unique_keys['Brand_Category'] = unique_keys.apply(
+                    lambda r: _cat_vec(r['_au'], r['_pu'], r['_bu']), axis=1)
+                df = df.merge(unique_keys[['_key','Brand_Category']], on='_key', how='left')
+
+                # FIX 2: Reward — vectorized via map
+                reward_map = {}
+                for cl,br_map in REWARD_RATES.items():
+                    for bc,rate in br_map.items():
+                        reward_map[(cl,bc)] = rate
+                df['Reward_per_Ton'] = [reward_map.get((cl,bc),0.0)
+                                        for cl,bc in zip(df['Cluster Pareto'],df['Brand_Category'])]
+                df.drop(columns=['_au','_pu','_bu','_key'], inplace=True)
 
                 dv = df[df['Brand_Category']!='Other'].copy()
                 if dv.empty: st.warning("Tidak ada transaksi brand valid."); st.stop()
@@ -243,29 +277,44 @@ if uploaded_file:
 
                 n1 = len(agg)
                 agg = agg[agg['Total_Bulan'] >= MIN_BULAN_AKTIF].copy()
+                agg.reset_index(drop=True, inplace=True)
                 st.info(f"ℹ️ {n1-len(agg):,} toko difilter (< {MIN_BULAN_AKTIF} bulan aktif)")
 
-                # Ton_Growth survivorship-corrected
+                # FIX 3: Ton_Growth — vectorized pivot (bukan loop per toko)
                 tlast = grp['Bulan'].max()
-                growths = []
-                for sid in agg['ID Toko']:
-                    td = grp[grp['ID Toko']==sid]
-                    lv = td[td['Bulan']==tlast]['Total_Ton']
-                    lv = lv.values[0] if len(lv)>0 else 0.0
-                    pv = td[td['Bulan']<tlast]['Total_Ton']
-                    pm = pv.mean() if len(pv)>0 else 0.0
-                    growths.append((lv-pm)/pm if pm>0 else 0.0)
-                agg['Ton_Growth'] = growths
+                valid_ids = set(agg['ID Toko'])
+                grp_f = grp[grp['ID Toko'].isin(valid_ids)].copy()
 
+                # Ton bulan terakhir per toko
+                last_df = (grp_f[grp_f['Bulan']==tlast]
+                           .groupby('ID Toko')['Total_Ton'].sum().reset_index()
+                           .rename(columns={'Total_Ton':'Last_Ton'}))
+                # Mean bulan sebelumnya per toko
+                prev_df = (grp_f[grp_f['Bulan']<tlast]
+                           .groupby('ID Toko')['Total_Ton'].mean().reset_index()
+                           .rename(columns={'Total_Ton':'Prev_Mean'}))
+
+                growth_df = agg[['ID Toko']].merge(last_df, on='ID Toko', how='left')
+                growth_df = growth_df.merge(prev_df, on='ID Toko', how='left')
+                growth_df['Last_Ton']  = growth_df['Last_Ton'].fillna(0)
+                growth_df['Prev_Mean'] = growth_df['Prev_Mean'].fillna(0)
+                growth_df['Ton_Growth'] = np.where(
+                    growth_df['Prev_Mean'] > 0,
+                    (growth_df['Last_Ton'] - growth_df['Prev_Mean']) / growth_df['Prev_Mean'],
+                    0.0)
+                agg = agg.merge(growth_df[['ID Toko','Ton_Growth']], on='ID Toko', how='left')
+                agg['Ton_Growth'] = agg['Ton_Growth'].fillna(0)
+
+                # FIX 4: Ratio_vs_Cluster — vectorized map
                 ca = agg.groupby('Cluster Pareto')['Avg_Ton'].mean().to_dict()
-                agg['Ratio_vs_Cluster'] = agg.apply(
-                    lambda r: r['Avg_Ton']/ca.get(r['Cluster Pareto'],1.0), axis=1)
+                agg['Ratio_vs_Cluster'] = agg['Avg_Ton'] / agg['Cluster Pareto'].map(ca).fillna(1.0)
 
-                # Estimated_Cost brand-mix weighted
+                # Estimated_Cost brand-mix weighted — sudah vectorized
                 tb = dv.groupby(['ID Toko','Brand_Category','Reward_per_Ton'])['TON Quantity'].sum().reset_index()
                 tb = tb.merge(agg[['ID Toko','Total_Bulan']], on='ID Toko', how='left')
-                tb['Cost_Brand'] = (tb['TON Quantity']/tb['Total_Bulan']) * tb['Reward_per_Ton']
-                ct = tb.groupby('ID Toko')['Cost_Brand'].sum().reset_index().rename(columns={'Cost_Brand':'Estimated_Cost'})
+                tb['Cost_Brand'] = (tb['TON Quantity']/tb['Total_Bulan'].replace(0,1)) * tb['Reward_per_Ton']
+                ct = (tb.groupby('ID Toko')['Cost_Brand'].sum().reset_index()
+                      .rename(columns={'Cost_Brand':'Estimated_Cost'}))
                 agg = agg.merge(ct, on='ID Toko', how='left')
                 agg['Estimated_Cost'] = agg['Estimated_Cost'].fillna(0)
 
