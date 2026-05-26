@@ -527,9 +527,9 @@ n_new       = selected_df['Is_New_Store'].sum() if 'Is_New_Store' in selected_df
 hidden_ton  = selected_df[selected_df['Is_New_Store']]['Avg_Ton'].sum() \
     if 'Is_New_Store' in selected_df.columns else 0
 
-tab1,tab2,tab3,tab4,tab5 = st.tabs([
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs([
     "📊 Ringkasan","📈 Kontribusi","🔍 Perbandingan Toko",
-    "📅 Tren Bulanan","📋 Data & Export"])
+    "📅 Tren Bulanan","📋 Data & Export","🔬 Skenario & Optimasi"])
 
 # ════ TAB 1 ════
 with tab1:
@@ -758,3 +758,259 @@ with tab5:
             data=buf.getvalue(),
             file_name=f"loyalty_ilpa_{datetime.now().strftime('%Y%m%d_%H%M')}.parquet",
             mime='application/octet-stream', use_container_width=True)
+
+# ════ TAB 6: SKENARIO & OPTIMASI ════
+with tab6:
+    st.markdown('<div class="section-header">🔬 Bandingkan Skenario — Temukan yang Terbaik</div>',
+                unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="info-box">
+    💡 <b>Cara kerja:</b> Sistem menjalankan beberapa kombinasi parameter sekaligus
+    dan membandingkan hasilnya — sehingga kamu bisa melihat trade-off antara
+    jumlah toko, budget, dan performa skor tanpa harus trial-error manual.
+    </div>
+    """, unsafe_allow_html=True)
+
+    if 'agg' not in st.session_state:
+        st.warning("Proses data terlebih dahulu.")
+    else:
+        agg_s6 = st.session_state.agg.copy()
+        agg_s6 = compute_scores(agg_s6, w1, w2, w3)
+        agg_s6.drop_duplicates(subset=['ID Toko'], inplace=True)
+
+        st.markdown("### ⚙️ Konfigurasi Skenario")
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.markdown("**Variasikan Budget (%)**")
+            budget_base  = max_budget if max_budget > 0 else agg_s6['Estimated_Cost'].sum() * 0.5
+            budget_pcts  = st.multiselect(
+                "Persentase dari budget acuan",
+                [50, 70, 80, 90, 100, 110, 120, 150],
+                default=[80, 100, 120],
+                help="100% = budget yang sedang diset di sidebar"
+            )
+        with col_s2:
+            st.markdown("**Variasikan Jumlah Toko (N_max)**")
+            n_base = N_max if N_max > 0 else 500
+            nmax_opts = st.multiselect(
+                "Pilihan N_max",
+                [int(n_base*p) for p in [0.7, 0.8, 0.9, 1.0, 1.1, 1.2]],
+                default=[int(n_base*0.8), n_base, int(n_base*1.2)],
+                help="Berapa toko yang ingin dipilih di tiap skenario"
+            )
+
+        use_cluster_s6 = st.checkbox(
+            "Terapkan Mirror Constraint (proporsi cluster dari existing)",
+            value=bool(existing_ids),
+            help="Centang untuk ILP-A Mirror, kosongkan untuk ILP-C (bebas)"
+        )
+
+        run_scenarios = st.button("▶️ Jalankan Semua Skenario", type="primary",
+                                   use_container_width=True,
+                                   disabled=(not budget_pcts or not nmax_opts))
+
+        if run_scenarios:
+            # Hitung cluster_pcts jika Mirror
+            cl_pcts_s6 = {}
+            if use_cluster_s6 and len(existing_in_pool) > 0:
+                cl_pcts_s6 = (existing_in_pool['Cluster Pareto']
+                               .value_counts(normalize=True).mul(100).to_dict())
+
+            results_s6 = []
+            total_runs  = len(budget_pcts) * len(nmax_opts)
+            prog        = st.progress(0, text="Menjalankan skenario...")
+
+            for idx, (bp, nm) in enumerate(
+                    [(b,n) for b in sorted(budget_pcts) for n in sorted(nmax_opts)]):
+
+                budget_s6 = budget_base * bp / 100
+                nmax_s6   = int(nm)
+
+                # Jalankan ILP
+                prob_s6   = pulp.LpProblem(f"S_{bp}_{nm}", pulp.LpMaximize)
+                xv_s6     = {row['ID Toko']: pulp.LpVariable(f"x_{i}", cat='Binary')
+                              for i,row in agg_s6.iterrows()}
+
+                prob_s6  += pulp.lpSum(row['Score']*xv_s6[row['ID Toko']]
+                                       for _,row in agg_s6.iterrows())
+                prob_s6  += pulp.lpSum(xv_s6.values()) <= nmax_s6
+                prob_s6  += pulp.lpSum(row['Estimated_Cost']*xv_s6[row['ID Toko']]
+                                       for _,row in agg_s6.iterrows()) <= budget_s6
+
+                if cl_pcts_s6:
+                    for cl,pct in cl_pcts_s6.items():
+                        mem = agg_s6[agg_s6['Cluster Pareto']==cl]['ID Toko'].tolist()
+                        cap = int(math.ceil(pct/100*nmax_s6))
+                        if mem and cap > 0:
+                            prob_s6 += pulp.lpSum(xv_s6[s] for s in mem if s in xv_s6) <= cap
+
+                prob_s6.solve(pulp.PULP_CBC_CMD(msg=False))
+
+                sel_ids = [s for s,v in xv_s6.items() if pulp.value(v)==1]
+                sel_s6  = agg_s6[agg_s6['ID Toko'].isin(sel_ids)]
+
+                actual_cost  = sel_s6['Estimated_Cost'].sum()
+                total_score  = sel_s6['Score'].sum()
+                total_ton    = sel_s6['Avg_Ton'].sum()
+                n_new_s6     = (~sel_s6['ID Toko'].isin(existing_ids)).sum()
+                hidden_s6    = agg_s6[agg_s6['ID Toko'].isin(
+                                   set(sel_ids) - existing_ids)]['Avg_Ton'].sum()
+                score_per_rp = total_score / (actual_cost/1e6) if actual_cost > 0 else 0
+
+                # Feasibility check
+                feasible = actual_cost <= budget_s6 * 1.03
+
+                results_s6.append({
+                    'Skenario'          : f"Budget {bp}% | N={nm:,}",
+                    'Budget_Setting_%'  : bp,
+                    'N_max'             : nm,
+                    'N_Terpilih'        : len(sel_ids),
+                    'Budget_Ceiling'    : round(budget_s6, 0),
+                    'Budget_Terpakai'   : round(actual_cost, 0),
+                    'Budget_Util_%'     : round(actual_cost/budget_s6*100, 1) if budget_s6 > 0 else 0,
+                    'Total_Score'       : round(total_score, 2),
+                    'Avg_Score_per_Toko': round(sel_s6['Score'].mean(), 4),
+                    'Total_Est_Ton'     : round(total_ton, 2),
+                    'Avg_Ton_per_Toko'  : round(sel_s6['Avg_Ton'].mean(), 2),
+                    'N_Toko_Baru'       : int(n_new_s6),
+                    'Hidden_Ton'        : round(hidden_s6, 2),
+                    'Score_per_Juta_Rp' : round(score_per_rp, 4),
+                    'Feasible'          : '✅' if feasible else '❌',
+                })
+
+                prog.progress((idx+1)/total_runs,
+                               text=f"Skenario {idx+1}/{total_runs}: Budget {bp}% | N={nm:,}")
+
+            prog.empty()
+            df_s6 = pd.DataFrame(results_s6)
+            st.session_state.scenario_df = df_s6
+
+        if 'scenario_df' in st.session_state:
+            df_s6 = st.session_state.scenario_df
+
+            # ── Highlight skenario terbaik ────────────────────────
+            st.markdown("### 📊 Hasil Perbandingan Skenario")
+
+            # Terbaik = Score tertinggi yang feasible
+            feasible_df = df_s6[df_s6['Feasible']=='✅']
+            if not feasible_df.empty:
+                best_idx   = feasible_df['Total_Score'].idxmax()
+                best_label = df_s6.loc[best_idx,'Skenario']
+
+                # Efficient = skor per rupiah tertinggi
+                efficient_idx   = feasible_df['Score_per_Juta_Rp'].idxmax()
+                efficient_label = df_s6.loc[efficient_idx,'Skenario']
+
+                col_b1, col_b2 = st.columns(2)
+                with col_b1:
+                    st.markdown(f"""
+                    <div class="ok-box">
+                    🏆 <b>Skor Tertinggi:</b> {best_label}<br>
+                    Total Score = {df_s6.loc[best_idx,'Total_Score']:,.2f} |
+                    Avg Ton = {df_s6.loc[best_idx,'Avg_Ton_per_Toko']:.2f} |
+                    N = {df_s6.loc[best_idx,'N_Terpilih']:,}
+                    </div>""", unsafe_allow_html=True)
+                with col_b2:
+                    st.markdown(f"""
+                    <div class="info-box">
+                    💰 <b>Paling Efisien (Skor/Rupiah):</b> {efficient_label}<br>
+                    Score/Juta = {df_s6.loc[efficient_idx,'Score_per_Juta_Rp']:.4f} |
+                    Budget Util = {df_s6.loc[efficient_idx,'Budget_Util_%']:.1f}%
+                    </div>""", unsafe_allow_html=True)
+
+            st.markdown("#### Tabel Lengkap")
+            def highlight_best(row):
+                if row['Skenario'] == best_label:
+                    return ['background-color:#e8f5e9']*len(row)
+                if row['Feasible'] == '❌':
+                    return ['background-color:#fff3e0']*len(row)
+                return ['']*len(row)
+
+            show_cols_s6 = ['Skenario','N_Terpilih','Budget_Util_%','Total_Score',
+                            'Avg_Score_per_Toko','Avg_Ton_per_Toko',
+                            'N_Toko_Baru','Hidden_Ton','Score_per_Juta_Rp','Feasible']
+            st.dataframe(
+                df_s6[show_cols_s6].style
+                .format({'Budget_Util_%':'{:.1f}%','Total_Score':'{:,.2f}',
+                         'Avg_Score_per_Toko':'{:.4f}','Avg_Ton_per_Toko':'{:.2f}',
+                         'Hidden_Ton':'{:,.2f}','Score_per_Juta_Rp':'{:.4f}'})
+                .apply(highlight_best, axis=1),
+                use_container_width=True, hide_index=True)
+
+            # ── Chart: Score vs Budget Utilization ───────────────
+            st.markdown("#### Visualisasi Trade-off")
+            col_v1, col_v2 = st.columns(2)
+            with col_v1:
+                chart_score = (
+                    alt.Chart(df_s6[df_s6['Feasible']=='✅'])
+                    .mark_circle(size=120)
+                    .encode(
+                        x=alt.X('N_max:Q', title='N_max (Jumlah Toko)'),
+                        y=alt.Y('Total_Score:Q', title='Total Score'),
+                        color=alt.Color('Budget_Setting_%:O',
+                                        title='Budget %',
+                                        scale=alt.Scale(scheme='blues')),
+                        tooltip=['Skenario','N_Terpilih','Total_Score',
+                                 'Budget_Util_%','Avg_Ton_per_Toko']
+                    )
+                    .properties(height=280, title='Total Score vs N_max (per Budget %)')
+                    .interactive()
+                )
+                st.altair_chart(chart_score, use_container_width=True)
+
+            with col_v2:
+                chart_eff = (
+                    alt.Chart(df_s6[df_s6['Feasible']=='✅'])
+                    .mark_circle(size=120)
+                    .encode(
+                        x=alt.X('Budget_Util_%:Q', title='Budget Utilization (%)'),
+                        y=alt.Y('Score_per_Juta_Rp:Q', title='Score per Juta Rp'),
+                        color=alt.Color('N_max:O',
+                                        title='N_max',
+                                        scale=alt.Scale(scheme='greens')),
+                        tooltip=['Skenario','N_Terpilih','Score_per_Juta_Rp',
+                                 'Budget_Util_%','Total_Score']
+                    )
+                    .properties(height=280, title='Efisiensi: Score/Rupiah vs Budget Utilization')
+                    .interactive()
+                )
+                st.altair_chart(chart_eff, use_container_width=True)
+
+            # ── Bar: Avg Ton per Toko antar skenario ─────────────
+            bar_ton = (
+                alt.Chart(df_s6)
+                .mark_bar()
+                .encode(
+                    x=alt.X('Skenario:N', sort='-y', title=''),
+                    y=alt.Y('Avg_Ton_per_Toko:Q', title='Avg Ton/Toko'),
+                    color=alt.Color('Feasible:N',
+                                    scale=alt.Scale(domain=['✅','❌'],
+                                                    range=['#4CAF50','#FF9800'])),
+                    tooltip=['Skenario','Avg_Ton_per_Toko','N_Terpilih','Budget_Util_%']
+                )
+                .properties(height=250, title='Rata-rata Tonase per Toko per Skenario')
+            )
+            st.altair_chart(bar_ton, use_container_width=True)
+
+            # ── Panduan membaca ───────────────────────────────────
+            st.markdown("""
+            <div class="info-box">
+            📖 <b>Cara membaca hasil:</b><br><br>
+            • <b>Total Score tinggi</b> = portfolio secara keseluruhan lebih berkualitas<br>
+            • <b>Avg Ton/Toko tinggi</b> = rata-rata toko yang dipilih punya volume besar<br>
+            • <b>Score/Juta Rp tinggi</b> = nilai per rupiah yang dikeluarkan lebih efisien<br>
+            • <b>N_Toko_Baru</b> = berapa toko di luar program existing yang berhasil diidentifikasi<br>
+            • <b>Hidden Ton</b> = estimasi tonase tambahan dari toko baru tersebut<br><br>
+            💡 <b>Rekomendasi:</b> Pilih skenario dengan <b>Score/Juta Rp tertinggi</b>
+            yang masih dalam budget feasible — bukan selalu yang paling banyak toko atau budget terbesar.
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Download
+            st.download_button(
+                "📊 Download Semua Skenario (CSV)",
+                data=df_s6.to_csv(index=False).encode('utf-8-sig'),
+                file_name=f"skenario_ilp_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime='text/csv', use_container_width=True)
